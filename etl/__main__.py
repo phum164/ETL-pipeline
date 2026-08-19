@@ -1,0 +1,36 @@
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+
+from .config import Settings
+from .pipeline import check_connections, run_pipeline
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="RM Sales-Stock Data Warehouse ETL")
+    parser.add_argument("command", choices=("check", "full", "incremental"))
+    args = parser.parse_args()
+
+    try:
+        settings = Settings.from_env()
+    except ValueError as error:
+        parser.print_usage(sys.stderr)
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    if args.command == "check":
+        check_connections(settings)
+        logging.getLogger("rm_dw_etl").info("source and warehouse contracts are ready")
+        return 0
+    return run_pipeline(settings, args.command)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

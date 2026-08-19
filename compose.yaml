@@ -1,0 +1,7 @@
+services:
+  rm-dw-etl:
+    build:
+      context: .
+    env_file:
+      - ${ETL_ENV_FILE:-.env}
+    restart: "no"
