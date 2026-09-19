@@ -1,0 +1,15 @@
+name: cfmanager-data-engineering
+
+services:
+  warehouse-db-etl:
+    image: ${ETL_IMAGE:?Set ETL_IMAGE to a digest-pinned GHCR image}
+    env_file:
+      - ${ETL_ENV_FILE:-/opt/cfmanager/secrets/data-engineering.env}
+    restart: "no"
+    networks:
+      - data-network
+
+networks:
+  data-network:
+    external: true
+    name: cfmanager_data-network

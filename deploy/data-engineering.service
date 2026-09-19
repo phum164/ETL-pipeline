@@ -1,0 +1,16 @@
+[Unit]
+Description=RM daily warehouse ETL
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/cfmanager/data-engineering
+EnvironmentFile=/opt/cfmanager/releases/data-engineering.env
+ExecStart=/usr/bin/docker compose -f /opt/cfmanager/data-engineering/compose.yaml run --rm warehouse-db-etl incremental
+Restart=on-failure
+RestartSec=15min
+TimeoutStartSec=2h

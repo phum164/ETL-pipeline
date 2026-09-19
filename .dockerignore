@@ -1,0 +1,10 @@
+.git
+.github
+.env*
+deploy
+logs
+scripts
+tests
+__pycache__
+*.py[cod]
+README.md

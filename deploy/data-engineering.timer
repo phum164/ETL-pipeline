@@ -1,0 +1,11 @@
+[Unit]
+Description=Run RM warehouse ETL daily
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 Asia/Bangkok
+Persistent=true
+RandomizedDelaySec=5m
+Unit=data-engineering.service
+
+[Install]
+WantedBy=timers.target

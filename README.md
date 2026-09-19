@@ -73,6 +73,51 @@ Exit codes:
 - `2`: `SUCCEEDED_WITH_REJECTS`; inspect `etl.rejected_row`
 - `1`: configuration, connection, extraction, validation, or transform failure
 
+## Ubuntu VPS
+
+The `main` workflow tests Python and warehouse SQL, publishes a commit-SHA image,
+and records its immutable digest. On the VPS, keep only the deployment files and
+secrets:
+
+```bash
+sudo install -d -m 0755 /opt/cfmanager/data-engineering /opt/cfmanager/releases
+sudo install -d -m 0700 /opt/cfmanager/secrets
+sudo install -m 0644 deploy/compose.yaml /opt/cfmanager/data-engineering/compose.yaml
+sudo install -m 0600 deploy/production.env.example /opt/cfmanager/secrets/data-engineering.env
+sudo install -m 0644 deploy/release.env.example /opt/cfmanager/releases/data-engineering.env
+```
+
+Replace every placeholder and copy the exact digest-pinned `ETL_IMAGE` from a
+successful workflow's summary. The production Compose file joins the backend
+stack's external `cfmanager_data-network`; adjust that name only if the backend
+Compose project uses another project name. Then authenticate to GHCR if the
+package is private and validate before the first load:
+
+```bash
+sudo docker login ghcr.io
+sudo docker compose --env-file /opt/cfmanager/releases/data-engineering.env \
+  -f /opt/cfmanager/data-engineering/compose.yaml pull
+sudo docker compose --env-file /opt/cfmanager/releases/data-engineering.env \
+  -f /opt/cfmanager/data-engineering/compose.yaml run --rm warehouse-db-etl check
+sudo docker compose --env-file /opt/cfmanager/releases/data-engineering.env \
+  -f /opt/cfmanager/data-engineering/compose.yaml run --rm warehouse-db-etl full
+```
+
+After the one-time full load succeeds, install the daily timer:
+
+```bash
+sudo install -m 0644 deploy/data-engineering.service /etc/systemd/system/
+sudo install -m 0644 deploy/data-engineering.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now data-engineering.timer
+systemctl list-timers data-engineering.timer
+```
+
+The timer runs at 02:00 Asia/Bangkok with a small randomized delay. The service
+retries failures up to three times per hour; the ETL's PostgreSQL advisory lock
+still prevents overlapping warehouse runs. Inspect failures with
+`journalctl -u data-engineering.service`.
+
 ## Local development
 
 ```powershell
