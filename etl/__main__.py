@@ -9,7 +9,7 @@ from .pipeline import check_connections, run_pipeline
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="RM Sales-Stock Data Warehouse ETL")
+    parser = argparse.ArgumentParser(description="Warehouse Sales-Stock Data ETL")
     parser.add_argument("command", choices=("check", "full", "incremental"))
     args = parser.parse_args()
 
@@ -27,7 +27,7 @@ def main() -> int:
 
     if args.command == "check":
         check_connections(settings)
-        logging.getLogger("rm_dw_etl").info("source and warehouse contracts are ready")
+        logging.getLogger("warehouse_db_etl").info("source and warehouse contracts are ready")
         return 0
     return run_pipeline(settings, args.command)
 

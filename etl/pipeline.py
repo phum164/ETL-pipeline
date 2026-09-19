@@ -14,9 +14,9 @@ from psycopg import sql
 from .config import Settings
 
 
-LOGGER = logging.getLogger("rm_dw_etl")
+LOGGER = logging.getLogger("warehouse_db_etl")
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-PIPELINE_LOCK_NAME = "rm_dw:etl_pipeline"
+PIPELINE_LOCK_NAME = "warehouse_db:etl_pipeline"
 
 # Keep this contract beside DATASETS so `check` fails before a batch is created
 # when an OLTP table/column used by an extract has drifted.
@@ -58,6 +58,11 @@ WAREHOUSE_CONTRACTS: dict[tuple[str, str], tuple[str, ...]] = {
     ("etl", "load_batch"): ("batch_id", "source_system", "status", "completed_at"),
     ("etl", "watermark"): ("source_system", "entity_name", "last_changed_at", "last_source_id", "last_successful_batch_id"),
     ("etl", "rejected_row"): ("batch_id", "entity_name", "source_id", "reason"),
+    ("dw", "dim_customer"): (
+        "customer_key", "source_system", "customer_source_id", "customer_name",
+        "latest_province_name", "latest_postal_code", "source_updated_at", "last_loaded_batch_id",
+    ),
+    ("dw", "fact_order"): ("customer_key", "buyer_source_id", "province_name"),
 }
 
 
@@ -444,7 +449,7 @@ def _check_contracts(source: psycopg.Connection, target: psycopg.Connection) -> 
 
 
 def _acquire_pipeline_lock(target: psycopg.Connection) -> None:
-    # ponytail: one warehouse-wide lock keeps daily/manual ETL runs deterministic;
+    # one warehouse-wide lock keeps daily/manual ETL runs deterministic;
     # use per-source locks only after throughput requires concurrent pipelines.
     with target.cursor() as cursor:
         cursor.execute("SELECT pg_advisory_lock(hashtext(%s))", (PIPELINE_LOCK_NAME,))

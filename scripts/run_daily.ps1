@@ -25,7 +25,7 @@ try {
     "[$(Get-Date -Format o)] starting RM data-engineering incremental batch" |
         Tee-Object -FilePath $logPath
     & docker compose --project-directory $repoRoot --env-file $envFile `
-        -f (Join-Path $repoRoot 'compose.yaml') run --rm rm-dw-etl incremental *>&1 |
+        -f (Join-Path $repoRoot 'compose.yaml') run --rm warehouse-db-etl incremental *>&1 |
         Tee-Object -FilePath $logPath -Append
     $exitCode = $LASTEXITCODE
     "[$(Get-Date -Format o)] finished with exit code $exitCode" |

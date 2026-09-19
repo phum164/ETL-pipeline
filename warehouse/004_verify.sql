@@ -1,9 +1,9 @@
--- Run after 001_bootstrap.sql, 002_transform.sql, and 003_marts.sql on rm_dw_test.
+-- Run after 001_bootstrap.sql, 002_transform.sql, and 003_marts.sql on warehouse_db_test.
 -- The transaction rolls all fixture data back.
 BEGIN;
 
 INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
-VALUES ('11111111-1111-1111-1111-111111111111', 'rm_oltp', '2026-07-01 00:00+00', '2026-07-02 00:00+00');
+VALUES ('11111111-1111-1111-1111-111111111111', 'db_oltp', '2026-07-01 00:00+00', '2026-07-02 00:00+00');
 
 INSERT INTO stg.sales_channels (batch_id, source_id, code, name, source_updated_at)
 VALUES ('11111111-1111-1111-1111-111111111111', 1, 'POS', 'Point of Sale', '2026-07-01 00:00+00');
@@ -25,7 +25,8 @@ INSERT INTO stg.orders (
 )
 VALUES
   ('11111111-1111-1111-1111-111111111111', 1001, 'ORD-1001', '2026-07-01 01:00+00', 'delivered', 1, 501, 'Buyer A', 'Bangkok', '10110', 200, 200, '2026-07-01 03:00+00'),
-  ('11111111-1111-1111-1111-111111111111', 1002, 'ORD-1002', '2026-07-01 02:00+00', 'cancelled', 1, 502, 'Buyer B', 'Chiang Mai', NULL, 100, 100, '2026-07-01 04:00+00');
+  ('11111111-1111-1111-1111-111111111111', 1002, 'ORD-1002', '2026-07-01 02:00+00', 'cancelled', 1, 501, 'Buyer A Updated', 'Chiang Mai', '50000', 100, 100, '2026-07-01 04:00+00'),
+  ('11111111-1111-1111-1111-111111111111', 1003, 'ORD-1003', '2026-07-01 05:00+00', 'pending', 1, NULL, 'Guest', 'Bangkok', '10110', 50, 50, '2026-07-01 05:00+00');
 
 INSERT INTO stg.order_status_history (batch_id, source_id, order_source_id, new_status, occurred_at)
 VALUES ('11111111-1111-1111-1111-111111111111', 5001, 1001, 'delivered', '2026-07-01 03:00+00');
@@ -55,15 +56,20 @@ VALUES ('11111111-1111-1111-1111-111111111111', 101, 1, 8, 2, 1, 8, 8, 8, '2026-
 SELECT * FROM etl.apply_sales_stock_batch('11111111-1111-1111-1111-111111111111');
 SELECT * FROM etl.apply_sales_stock_batch('11111111-1111-1111-1111-111111111111');
 
+UPDATE dw.fact_order
+SET customer_key = 0
+WHERE source_system = 'db_oltp' AND buyer_source_id IS NOT NULL;
+SELECT etl.backfill_customer_dimension();
+
 DO $$
 BEGIN
-  IF (SELECT COUNT(*) FROM dw.fact_order WHERE source_system = 'rm_oltp') <> 2 THEN
-    RAISE EXCEPTION 'Expected two idempotent order facts';
+  IF (SELECT COUNT(*) FROM dw.fact_order WHERE source_system = 'db_oltp') <> 3 THEN
+    RAISE EXCEPTION 'Expected three idempotent order facts';
   END IF;
-  IF (SELECT COUNT(*) FROM dw.fact_order_line WHERE source_system = 'rm_oltp') <> 2 THEN
+  IF (SELECT COUNT(*) FROM dw.fact_order_line WHERE source_system = 'db_oltp') <> 2 THEN
     RAISE EXCEPTION 'Expected two idempotent order-line facts';
   END IF;
-  IF (SELECT booked_sales_amount FROM mart.v_sales_daily WHERE business_date = DATE '2026-07-01' AND channel_code = 'POS') <> 200 THEN
+  IF (SELECT booked_sales_amount FROM mart.v_sales_daily WHERE business_date = DATE '2026-07-01' AND channel_code = 'POS') <> 250 THEN
     RAISE EXCEPTION 'Booked revenue duplicated or incorrect';
   END IF;
   IF (SELECT line_subtotal_amount FROM mart.v_sales_product_daily WHERE business_date = DATE '2026-07-01' AND channel_code = 'POS' AND product_source_id = 10) <> 200 THEN
@@ -75,14 +81,56 @@ BEGIN
   IF (SELECT delivered_sales_amount FROM mart.v_sales_daily WHERE business_date = DATE '2026-07-01' AND channel_code = 'POS') <> 200 THEN
     RAISE EXCEPTION 'Delivered revenue incorrect';
   END IF;
-  IF (SELECT buyer_name FROM dw.fact_order WHERE source_system = 'rm_oltp' AND order_source_id = 1001) <> 'Buyer A' THEN
+  IF (SELECT buyer_name FROM dw.fact_order WHERE source_system = 'db_oltp' AND order_source_id = 1001) <> 'Buyer A' THEN
     RAISE EXCEPTION 'Buyer snapshot incorrect';
+  END IF;
+  IF (SELECT COUNT(*) FROM dw.dim_customer WHERE source_system = 'db_oltp') <> 1 THEN
+    RAISE EXCEPTION 'Customer dimension upsert is not idempotent';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.dim_customer
+    WHERE source_system = 'db_oltp' AND customer_source_id = 501
+      AND customer_name = 'Buyer A Updated' AND latest_province_name = 'Chiang Mai'
+      AND latest_postal_code = '50000'
+  ) THEN
+    RAISE EXCEPTION 'Latest customer snapshot was not applied';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM dw.fact_order
+    WHERE source_system = 'db_oltp' AND buyer_source_id IS NOT NULL AND customer_key = 0
+  ) THEN
+    RAISE EXCEPTION 'Known customer fact uses unknown customer key';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'dw.fact_order'::regclass
+      AND conname = 'fact_order_customer_key_fkey' AND contype = 'f'
+  ) THEN
+    RAISE EXCEPTION 'Customer fact foreign key is missing';
+  END IF;
+  IF (SELECT customer_key FROM dw.fact_order WHERE source_system = 'db_oltp' AND order_source_id = 1003) <> 0 THEN
+    RAISE EXCEPTION 'Guest order should use unknown customer key';
   END IF;
   IF (SELECT booked_sales_amount FROM mart.v_sales_buyer_daily WHERE business_date = DATE '2026-07-01' AND buyer_name = 'Buyer A') <> 200 THEN
     RAISE EXCEPTION 'Buyer mart incorrect';
   END IF;
-  IF (SELECT booked_sales_amount FROM mart.v_sales_province_daily WHERE business_date = DATE '2026-07-01' AND province_name = 'Bangkok') <> 200 THEN
+  IF NOT EXISTS (
+    SELECT 1 FROM mart.v_sales_buyer_daily
+    WHERE business_date = DATE '2026-07-01' AND buyer_name = 'Buyer A'
+      AND customer_name = 'Buyer A Updated' AND latest_province_name = 'Chiang Mai'
+  ) THEN
+    RAISE EXCEPTION 'Buyer mart customer dimension columns incorrect';
+  END IF;
+  IF (SELECT booked_sales_amount FROM mart.v_sales_province_daily WHERE business_date = DATE '2026-07-01' AND province_name = 'Bangkok') <> 250 THEN
     RAISE EXCEPTION 'Province mart incorrect';
+  END IF;
+  IF (
+    SELECT COUNT(DISTINCT buyer_source_id)
+    FROM mart.v_sales_buyer_daily
+    WHERE business_date = DATE '2026-07-01' AND province_name = 'Bangkok'
+      AND booked_order_count > 0
+  ) <> 1 THEN
+    RAISE EXCEPTION 'Province customer count included guest or double-counted customer';
   END IF;
   IF (SELECT available_quantity FROM mart.v_inventory_daily WHERE business_date = DATE '2026-07-01' AND sku_code = 'SILK-RED') <> 8 THEN
     RAISE EXCEPTION 'Inventory available quantity incorrect';
@@ -91,7 +139,7 @@ END;
 $$;
 
 INSERT INTO etl.load_batch (batch_id, source_system)
-VALUES ('33333333-3333-3333-3333-333333333333', 'rm_oltp');
+VALUES ('33333333-3333-3333-3333-333333333333', 'db_oltp');
 INSERT INTO stg.order_lines (
   batch_id, source_id, order_source_id, sku_source_id, quantity, unit_price,
   line_subtotal_amount, source_updated_at
@@ -115,7 +163,7 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1
     FROM etl.watermark
-    WHERE source_system = 'rm_oltp'
+    WHERE source_system = 'db_oltp'
       AND entity_name = 'order_lines'
       AND last_source_id = 2002
       AND last_successful_batch_id = '11111111-1111-1111-1111-111111111111'::UUID
@@ -126,7 +174,7 @@ END;
 $$;
 
 INSERT INTO etl.load_batch (batch_id, source_system)
-VALUES ('22222222-2222-2222-2222-222222222222', 'rm_oltp');
+VALUES ('22222222-2222-2222-2222-222222222222', 'db_oltp');
 INSERT INTO stg.sales_channels (batch_id, source_id, code, name, source_updated_at)
 VALUES ('22222222-2222-2222-2222-222222222222', 2, ' ', 'Invalid channel', '2026-07-02 00:00+00');
 
@@ -137,7 +185,7 @@ BEGIN
   IF (SELECT status FROM etl.load_batch WHERE batch_id = '22222222-2222-2222-2222-222222222222') <> 'FAILED' THEN
     RAISE EXCEPTION 'Invalid batch should fail';
   END IF;
-  IF (SELECT last_successful_batch_id FROM etl.watermark WHERE source_system = 'rm_oltp' AND entity_name = 'sales_channels') <> '11111111-1111-1111-1111-111111111111'::UUID THEN
+  IF (SELECT last_successful_batch_id FROM etl.watermark WHERE source_system = 'db_oltp' AND entity_name = 'sales_channels') <> '11111111-1111-1111-1111-111111111111'::UUID THEN
     RAISE EXCEPTION 'Failed batch advanced watermark';
   END IF;
 END;

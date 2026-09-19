@@ -35,7 +35,7 @@ def _positive_int(name: str, default: int, minimum: int = 1) -> int:
 class Settings:
     oltp_database_url: str
     warehouse_database_url: str
-    source_system: str = "rm_oltp"
+    source_system: str = "db_oltp"
     chunk_size: int = 5000
     overlap_minutes: int = 5
     staging_retention_days: int = 30
@@ -51,7 +51,7 @@ class Settings:
         settings = cls(
             oltp_database_url=normalize_postgres_url(oltp_url),
             warehouse_database_url=normalize_postgres_url(warehouse_url),
-            source_system=os.getenv("ETL_SOURCE_SYSTEM", "rm_oltp").strip() or "rm_oltp",
+            source_system=os.getenv("ETL_SOURCE_SYSTEM", "db_oltp").strip() or "db_oltp",
             chunk_size=_positive_int("ETL_CHUNK_SIZE", 5000),
             overlap_minutes=_positive_int("ETL_OVERLAP_MINUTES", 5, minimum=0),
             staging_retention_days=_positive_int("ETL_STAGING_RETENTION_DAYS", 30),

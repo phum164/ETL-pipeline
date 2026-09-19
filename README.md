@@ -1,6 +1,6 @@
-# RM Sales-Stock Data Engineering
+# Sales-Stock Data Engineering
 
-Standalone Python and Pandas ETL for moving sales and stock data from the operational PostgreSQL database (`omsdb`) into the isolated warehouse (`rm_dw`). The backend application, Prisma schema, and OLTP data are not modified.
+Standalone Python and Pandas ETL for moving sales and stock data from the operational PostgreSQL database (`omsdb`) into the isolated warehouse (`warehouse_db`). The backend application, Prisma schema, and OLTP data are not modified.
 
 ## Flow
 
@@ -11,17 +11,17 @@ Standalone Python and Pandas ETL for moving sales and stock data from the operat
 5. Call `etl.apply_sales_stock_batch(batch_id)` to build dimensions, facts, snapshots, and marts.
 6. Return a scheduler-friendly exit code and retain the audit trail.
 
-Sales channels, SKU/Product/Category, and SKU-channel stock are full daily snapshots. Orders, order lines, order status history, and inventory movements are incremental with a five-minute overlap by default. Order extraction also snapshots the buyer name, province, and postal code when available; address lines, phone, email, credentials, tokens, and payment details are not copied. Treat `buyer_name` as restricted personal data and grant dashboard access only to authorized users.
+Sales channels, SKU/Product/Category, and SKU-channel stock are full daily snapshots. Orders, order lines, order status history, and inventory movements are incremental with a five-minute overlap by default. Order extraction also snapshots the buyer name, province, and postal code when available; `dw.dim_customer` keeps the latest of those order snapshots for known buyers while facts retain their order-time values. Address lines, phone, email, credentials, tokens, and payment details are not copied. Treat `buyer_name` as restricted personal data and grant dashboard access only to authorized users.
 
 ## Warehouse setup
 
-Provision a separate `rm_dw` database, then run the warehouse SQL in order:
+Provision a separate `warehouse_db` database, then run the warehouse SQL in order:
 
 ```powershell
 psql $env:WAREHOUSE_DATABASE_URL -v ON_ERROR_STOP=1 -f .\warehouse\001_bootstrap.sql
 psql $env:WAREHOUSE_DATABASE_URL -v ON_ERROR_STOP=1 -f .\warehouse\002_transform.sql
 psql $env:WAREHOUSE_DATABASE_URL -v ON_ERROR_STOP=1 -f .\warehouse\003_marts.sql
-# Optional: run the rollback-wrapped fixture verification against rm_dw_test.
+# Optional: run the rollback-wrapped fixture verification against warehouse_db_test.
 psql $env:WAREHOUSE_DATABASE_URL -v ON_ERROR_STOP=1 -f .\warehouse\004_verify.sql
 ```
 
@@ -44,9 +44,9 @@ read-only PostgreSQL session as a second guard.
 Copy `.env.example` to `.env` and use dedicated database roles. The OLTP role must be read-only.
 
 ```powershell
-docker compose run --rm rm-dw-etl check
-docker compose run --rm rm-dw-etl full
-docker compose run --rm rm-dw-etl incremental
+docker compose run --rm warehouse-db-etl check
+docker compose run --rm warehouse-db-etl full
+docker compose run --rm warehouse-db-etl incremental
 ```
 
 Run `full` once. For unattended Windows runs, keep secrets outside the repository

@@ -118,13 +118,20 @@ SELECT
   COUNT(*) FILTER (WHERE o.is_cancelled AND NOT o.is_deleted)::BIGINT AS cancelled_order_count,
   COALESCE(SUM(o.total_amount) FILTER (WHERE o.is_cancelled AND NOT o.is_deleted), 0)::NUMERIC(18, 2) AS cancelled_sales_amount,
   COUNT(*) FILTER (WHERE o.delivered_date_key IS NOT NULL AND NOT o.is_deleted)::BIGINT AS delivered_order_count,
-  COALESCE(SUM(o.total_amount) FILTER (WHERE o.delivered_date_key IS NOT NULL AND NOT o.is_deleted), 0)::NUMERIC(18, 2) AS delivered_sales_amount
+  COALESCE(SUM(o.total_amount) FILTER (WHERE o.delivered_date_key IS NOT NULL AND NOT o.is_deleted), 0)::NUMERIC(18, 2) AS delivered_sales_amount,
+  o.customer_key,
+  customer.customer_name,
+  customer.latest_province_name,
+  customer.latest_postal_code
 FROM dw.fact_order AS o
 JOIN dw.dim_date AS d ON d.date_key = o.order_date_key
 JOIN dw.dim_channel AS c ON c.channel_key = o.channel_key
+JOIN dw.dim_customer AS customer ON customer.customer_key = o.customer_key
 GROUP BY
   d.date_key, d.calendar_date, c.channel_key, c.channel_code, c.channel_name,
-  o.buyer_source_id, o.buyer_name, o.province_name, o.postal_code;
+  o.buyer_source_id, o.buyer_name, o.province_name, o.postal_code,
+  o.customer_key, customer.customer_name, customer.latest_province_name,
+  customer.latest_postal_code;
 
 -- Grain: one row per business date and province, suitable for ranking provinces.
 CREATE OR REPLACE VIEW mart.v_sales_province_daily AS

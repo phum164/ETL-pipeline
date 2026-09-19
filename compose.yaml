@@ -1,5 +1,5 @@
 services:
-  rm-dw-etl:
+  warehouse-db-etl:
     build:
       context: .
     env_file:

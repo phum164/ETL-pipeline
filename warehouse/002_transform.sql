@@ -1,4 +1,4 @@
--- Apply a staged rm_oltp extract. The caller reads etl.load_batch.status after this function returns.
+-- Apply a staged db_oltp extract. The caller reads etl.load_batch.status after this function returns.
 CREATE OR REPLACE FUNCTION etl.apply_sales_stock_batch(p_batch_id UUID)
 RETURNS TABLE (result_batch_id UUID, result_status TEXT, rejected_count BIGINT, result_error_message TEXT)
 LANGUAGE plpgsql
@@ -8,7 +8,7 @@ DECLARE
   v_rejected_count BIGINT := 0;
   v_error TEXT;
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtext('rm_dw:apply_sales_stock_batch'));
+  PERFORM pg_advisory_xact_lock(hashtext('warehouse_db:apply_sales_stock_batch'));
 
   SELECT * INTO v_batch
   FROM etl.load_batch
@@ -97,9 +97,28 @@ BEGIN
       last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
     WHERE EXCLUDED.source_updated_at >= dw.dim_sku.source_updated_at;
 
+    INSERT INTO dw.dim_customer (
+      source_system, customer_source_id, customer_name, latest_province_name,
+      latest_postal_code, source_updated_at, last_loaded_batch_id
+    )
+    SELECT DISTINCT ON (o.buyer_source_id)
+      v_batch.source_system, o.buyer_source_id, o.buyer_name, o.province_name,
+      o.postal_code, o.source_updated_at, p_batch_id
+    FROM stg.orders AS o
+    WHERE o.batch_id = p_batch_id
+      AND o.buyer_source_id IS NOT NULL
+    ORDER BY o.buyer_source_id, o.source_updated_at DESC, o.source_id DESC
+    ON CONFLICT (source_system, customer_source_id) DO UPDATE SET
+      customer_name = EXCLUDED.customer_name,
+      latest_province_name = EXCLUDED.latest_province_name,
+      latest_postal_code = EXCLUDED.latest_postal_code,
+      source_updated_at = EXCLUDED.source_updated_at,
+      last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
+    WHERE EXCLUDED.source_updated_at >= dw.dim_customer.source_updated_at;
+
     INSERT INTO dw.fact_order (
       source_system, order_source_id, order_number, order_at, order_date_key, channel_key,
-      buyer_source_id, buyer_name, province_name, postal_code,
+      customer_key, buyer_source_id, buyer_name, province_name, postal_code,
       current_status, is_cancelled, is_deleted, delivered_at, delivered_date_key,
       delivery_timestamp_source, subtotal_amount, discount_amount, shipping_fee_amount,
       tax_amount, total_amount, source_updated_at, last_loaded_batch_id
@@ -113,7 +132,8 @@ BEGIN
     )
     SELECT
       v_batch.source_system, o.source_id, o.order_number, o.order_at, etl.date_key(o.order_at),
-      COALESCE(c.channel_key, 0), o.buyer_source_id, o.buyer_name, o.province_name, o.postal_code,
+      COALESCE(channel.channel_key, 0), COALESCE(customer.customer_key, 0),
+      o.buyer_source_id, o.buyer_name, o.province_name, o.postal_code,
       o.current_status,
       LOWER(BTRIM(o.current_status)) = 'cancelled', o.deleted_at IS NOT NULL,
       COALESCE(h.delivered_at, CASE WHEN LOWER(BTRIM(o.current_status)) = 'delivered' THEN o.source_updated_at END),
@@ -126,14 +146,17 @@ BEGIN
       o.total_amount, o.source_updated_at, p_batch_id
     FROM stg.orders AS o
     LEFT JOIN delivered_history AS h ON h.order_source_id = o.source_id
-    LEFT JOIN dw.dim_channel AS c
-      ON c.source_system = v_batch.source_system AND c.channel_source_id = o.channel_source_id
+    LEFT JOIN dw.dim_channel AS channel
+      ON channel.source_system = v_batch.source_system AND channel.channel_source_id = o.channel_source_id
+    LEFT JOIN dw.dim_customer AS customer
+      ON customer.source_system = v_batch.source_system AND customer.customer_source_id = o.buyer_source_id
     WHERE o.batch_id = p_batch_id
     ON CONFLICT (source_system, order_source_id) DO UPDATE SET
       order_number = EXCLUDED.order_number,
       order_at = EXCLUDED.order_at,
       order_date_key = EXCLUDED.order_date_key,
       channel_key = EXCLUDED.channel_key,
+      customer_key = EXCLUDED.customer_key,
       buyer_source_id = EXCLUDED.buyer_source_id,
       buyer_name = EXCLUDED.buyer_name,
       province_name = EXCLUDED.province_name,
