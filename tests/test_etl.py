@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from etl.config import Settings, normalize_postgres_url
-from etl.pipeline import DATASETS, WAREHOUSE_CONTRACTS, _python_value, exit_code_for_status, prepare_frame
+from etl.pipeline import DATASETS, SOURCE_CONTRACTS, WAREHOUSE_CONTRACTS, _python_value, exit_code_for_status, prepare_frame
 from etl.__main__ import main
 
 
@@ -45,9 +45,18 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('"Province"', spec.query)
         self.assertIn('"Subdistrict"', spec.query)
 
+    def test_orders_extract_completed_physical_returns_once(self) -> None:
+        spec = next(item for item in DATASETS if item.name == "orders")
+        self.assertIn("return_received_at", spec.columns)
+        self.assertIn("MIN(rr.received_at)", spec.query)
+        self.assertIn("ri.received_quantity > 0", spec.query)
+        self.assertIn("return_requests", SOURCE_CONTRACTS)
+        self.assertIn("return_items", SOURCE_CONTRACTS)
+
     def test_customer_dimension_is_part_of_warehouse_contract(self) -> None:
         self.assertIn("customer_source_id", WAREHOUSE_CONTRACTS[("dw", "dim_customer")])
         self.assertIn("customer_key", WAREHOUSE_CONTRACTS[("dw", "fact_order")])
+        self.assertIn("return_received_at", WAREHOUSE_CONTRACTS[("dw", "fact_order")])
 
     def test_status_exit_codes(self) -> None:
         self.assertEqual(exit_code_for_status("SUCCEEDED"), 0)

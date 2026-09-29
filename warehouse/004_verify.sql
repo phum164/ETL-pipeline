@@ -6,7 +6,9 @@ INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, s
 VALUES ('11111111-1111-1111-1111-111111111111', 'db_oltp', '2026-07-01 00:00+00', '2026-07-02 00:00+00');
 
 INSERT INTO stg.sales_channels (batch_id, source_id, code, name, source_updated_at)
-VALUES ('11111111-1111-1111-1111-111111111111', 1, 'POS', 'Point of Sale', '2026-07-01 00:00+00');
+VALUES
+  ('11111111-1111-1111-1111-111111111111', 1, 'POS', 'Point of Sale', '2026-07-01 00:00+00'),
+  ('11111111-1111-1111-1111-111111111111', 2, 'TT', 'TikTok Shop', '2026-07-01 00:00+00');
 
 INSERT INTO stg.skus (
   batch_id, source_id, sku_code, product_source_id, product_name, category_source_id,
@@ -21,15 +23,22 @@ VALUES (
 INSERT INTO stg.orders (
   batch_id, source_id, order_number, order_at, current_status, channel_source_id,
   buyer_source_id, buyer_name, province_name, postal_code,
-  subtotal_amount, total_amount, source_updated_at
+  return_received_at, subtotal_amount, total_amount, source_updated_at
 )
 VALUES
-  ('11111111-1111-1111-1111-111111111111', 1001, 'ORD-1001', '2026-07-01 01:00+00', 'delivered', 1, 501, 'Buyer A', 'Bangkok', '10110', 200, 200, '2026-07-01 03:00+00'),
-  ('11111111-1111-1111-1111-111111111111', 1002, 'ORD-1002', '2026-07-01 02:00+00', 'cancelled', 1, 501, 'Buyer A Updated', 'Chiang Mai', '50000', 100, 100, '2026-07-01 04:00+00'),
-  ('11111111-1111-1111-1111-111111111111', 1003, 'ORD-1003', '2026-07-01 05:00+00', 'pending', 1, NULL, 'Guest', 'Bangkok', '10110', 50, 50, '2026-07-01 05:00+00');
+  ('11111111-1111-1111-1111-111111111111', 1001, 'ORD-1001', '2026-07-01 01:00+00', 'completed', 1, 501, 'Buyer A', 'Bangkok', '10110', NULL, 200, 200, '2026-07-01 03:00+00'),
+  ('11111111-1111-1111-1111-111111111111', 1002, 'ORD-1002', '2026-07-01 02:00+00', 'cancelled', 1, 501, 'Buyer A Updated', 'Chiang Mai', '50000', NULL, 100, 100, '2026-07-01 04:00+00'),
+  ('11111111-1111-1111-1111-111111111111', 1003, 'ORD-1003', '2026-07-01 05:00+00', 'pending', 1, NULL, 'Guest', 'Bangkok', '10110', NULL, 50, 50, '2026-07-01 05:00+00'),
+  ('11111111-1111-1111-1111-111111111111', 1004, 'ORD-1004', '2026-07-01 06:00+00', 'completed', 1, NULL, 'Walk-in', NULL, NULL, NULL, 75, 75, '2026-07-01 06:00+00'),
+  ('11111111-1111-1111-1111-111111111111', 1005, 'ORD-1005', '2026-07-01 07:00+00', 'refunded', 1, NULL, 'Walk-in', NULL, NULL, '2026-07-03 08:00+00', 125, 125, '2026-07-03 08:00+00'),
+  ('11111111-1111-1111-1111-111111111111', 1006, 'ORD-1006', '2026-07-01 09:00+00', 'completed', 2, NULL, 'Online', NULL, NULL, NULL, 300, 300, '2026-07-01 10:00+00');
 
 INSERT INTO stg.order_status_history (batch_id, source_id, order_source_id, new_status, occurred_at)
-VALUES ('11111111-1111-1111-1111-111111111111', 5001, 1001, 'delivered', '2026-07-01 03:00+00');
+VALUES
+  ('11111111-1111-1111-1111-111111111111', 5001, 1001, 'completed', '2026-07-01 03:00+00'),
+  ('11111111-1111-1111-1111-111111111111', 5002, 1005, 'completed', '2026-07-01 07:00+00'),
+  ('11111111-1111-1111-1111-111111111111', 5003, 1005, 'completed', '2026-07-01 07:30+00'),
+  ('11111111-1111-1111-1111-111111111111', 5004, 1006, 'completed', '2026-07-01 10:00+00');
 
 INSERT INTO stg.order_lines (
   batch_id, source_id, order_source_id, sku_source_id, quantity, unit_price,
@@ -63,13 +72,13 @@ SELECT etl.backfill_customer_dimension();
 
 DO $$
 BEGIN
-  IF (SELECT COUNT(*) FROM dw.fact_order WHERE source_system = 'db_oltp') <> 3 THEN
-    RAISE EXCEPTION 'Expected three idempotent order facts';
+  IF (SELECT COUNT(*) FROM dw.fact_order WHERE source_system = 'db_oltp') <> 6 THEN
+    RAISE EXCEPTION 'Expected six idempotent order facts';
   END IF;
   IF (SELECT COUNT(*) FROM dw.fact_order_line WHERE source_system = 'db_oltp') <> 2 THEN
     RAISE EXCEPTION 'Expected two idempotent order-line facts';
   END IF;
-  IF (SELECT booked_sales_amount FROM mart.v_sales_daily WHERE business_date = DATE '2026-07-01' AND channel_code = 'POS') <> 250 THEN
+  IF (SELECT booked_sales_amount FROM mart.v_sales_daily WHERE business_date = DATE '2026-07-01' AND channel_code = 'POS') <> 450 THEN
     RAISE EXCEPTION 'Booked revenue duplicated or incorrect';
   END IF;
   IF (SELECT line_subtotal_amount FROM mart.v_sales_product_daily WHERE business_date = DATE '2026-07-01' AND channel_code = 'POS' AND product_source_id = 10) <> 200 THEN
@@ -78,8 +87,37 @@ BEGIN
   IF (SELECT cancelled_sales_amount FROM mart.v_sales_daily WHERE business_date = DATE '2026-07-01' AND channel_code = 'POS') <> 100 THEN
     RAISE EXCEPTION 'Cancelled revenue incorrect';
   END IF;
-  IF (SELECT delivered_sales_amount FROM mart.v_sales_daily WHERE business_date = DATE '2026-07-01' AND channel_code = 'POS') <> 200 THEN
-    RAISE EXCEPTION 'Delivered revenue incorrect';
+  IF NOT EXISTS (
+    SELECT 1 FROM mart.v_sales_daily
+    WHERE business_date = DATE '2026-07-01' AND channel_code = 'POS'
+      AND delivered_order_count = 3 AND delivered_sales_amount = 400
+      AND returned_order_count = 1
+  ) THEN
+    RAISE EXCEPTION 'POS delivered or returned orders were not counted exactly once';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.fact_order
+    WHERE source_system = 'db_oltp' AND order_source_id = 1004
+      AND delivered_at = order_at AND delivery_timestamp_source = 'ORDER_UPDATED_AT_ESTIMATE'
+  ) THEN
+    RAISE EXCEPTION 'POS current-status fallback did not use order_at';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.fact_order
+    WHERE source_system = 'db_oltp' AND order_source_id = 1005
+      AND current_status = 'refunded'
+      AND delivered_at = '2026-07-01 07:00+00'::TIMESTAMPTZ
+      AND return_received_at = '2026-07-03 08:00+00'::TIMESTAMPTZ
+      AND delivery_timestamp_source = 'HISTORY'
+  ) THEN
+    RAISE EXCEPTION 'Refunded POS order lost its delivery or physical return event';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM dw.fact_order
+    WHERE source_system = 'db_oltp' AND order_source_id = 1006
+      AND delivered_at IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'Non-POS completed order was treated as delivered';
   END IF;
   IF (SELECT buyer_name FROM dw.fact_order WHERE source_system = 'db_oltp' AND order_source_id = 1001) <> 'Buyer A' THEN
     RAISE EXCEPTION 'Buyer snapshot incorrect';

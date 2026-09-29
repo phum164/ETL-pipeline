@@ -10,7 +10,8 @@ WITH metrics AS (
     COALESCE(SUM(total_amount) FILTER (WHERE is_cancelled AND NOT is_deleted), 0)::NUMERIC(18, 2) AS cancelled_sales_amount,
     0::BIGINT AS delivered_order_count,
     0::NUMERIC(18, 2) AS delivered_sales_amount,
-    0::BIGINT AS delivered_estimated_timestamp_count
+    0::BIGINT AS delivered_estimated_timestamp_count,
+    0::BIGINT AS returned_order_count
   FROM dw.fact_order
   GROUP BY order_date_key, channel_key
 
@@ -27,6 +28,9 @@ WITH metrics AS (
     COALESCE(SUM(total_amount) FILTER (WHERE NOT is_deleted), 0)::NUMERIC(18, 2),
     COUNT(*) FILTER (
       WHERE NOT is_deleted AND delivery_timestamp_source = 'ORDER_UPDATED_AT_ESTIMATE'
+    )::BIGINT,
+    COUNT(*) FILTER (
+      WHERE NOT is_deleted AND return_received_at IS NOT NULL
     )::BIGINT
   FROM dw.fact_order
   WHERE delivered_date_key IS NOT NULL
@@ -45,7 +49,8 @@ SELECT
   SUM(delivered_order_count)::BIGINT AS delivered_order_count,
   SUM(delivered_sales_amount)::NUMERIC(18, 2) AS delivered_sales_amount,
   SUM(delivered_estimated_timestamp_count)::BIGINT AS delivered_estimated_timestamp_count,
-  'Delivered Sales is gross and does not deduct returns in v1.'::TEXT AS delivered_sales_note
+  'Delivered Sales includes completed POS sales and is gross before returns.'::TEXT AS delivered_sales_note,
+  SUM(returned_order_count)::BIGINT AS returned_order_count
 FROM metrics AS m
 JOIN dw.dim_date AS d ON d.date_key = m.date_key
 JOIN dw.dim_channel AS c ON c.channel_key = m.channel_key

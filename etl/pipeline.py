@@ -39,6 +39,8 @@ SOURCE_CONTRACTS: dict[str, tuple[str, ...]] = {
     "Province": ("id", "province"),
     "Subdistrict": ("id", "zip_code"),
     "order_status_history": ("id", "orders_id", "new_status", "created_at"),
+    "return_requests": ("id", "orders_id", "received_at", "updated_at"),
+    "return_items": ("id", "return_requests_id", "received_quantity", "updated_at"),
     "order_details": (
         "id", "orders_id", "skus_id", "quantity", "unit_price", "discount", "subtotal",
         "deleted_at", "updated_at",
@@ -62,7 +64,7 @@ WAREHOUSE_CONTRACTS: dict[tuple[str, str], tuple[str, ...]] = {
         "customer_key", "source_system", "customer_source_id", "customer_name",
         "latest_province_name", "latest_postal_code", "source_updated_at", "last_loaded_batch_id",
     ),
-    ("dw", "fact_order"): ("customer_key", "buyer_source_id", "province_name"),
+    ("dw", "fact_order"): ("customer_key", "buyer_source_id", "province_name", "return_received_at"),
 }
 
 
@@ -143,13 +145,24 @@ DATASETS: tuple[DatasetSpec, ...] = (
         columns=(
             "batch_id", "source_id", "order_number", "order_at", "current_status",
             "channel_source_id", "buyer_source_id", "buyer_name", "province_name", "postal_code",
+            "return_received_at",
             "subtotal_amount", "discount_amount", "shipping_fee_amount",
             "tax_amount", "total_amount", "deleted_at", "source_updated_at",
         ),
         required_columns=("source_id", "order_at", "current_status", "source_updated_at"),
         key_columns=("source_id",),
         query="""
-            WITH order_extract AS (
+            WITH return_receipts AS (
+              SELECT
+                rr.orders_id,
+                MIN(rr.received_at) AS return_received_at,
+                MAX(GREATEST(rr.updated_at, ri.updated_at)) AS source_updated_at
+              FROM return_requests AS rr
+              JOIN return_items AS ri ON ri.return_requests_id = rr.id
+              WHERE rr.received_at IS NOT NULL
+                AND ri.received_quantity > 0
+              GROUP BY rr.orders_id
+            ), order_extract AS (
               SELECT
                 o.id::bigint AS source_id,
                 o.order_number,
@@ -167,6 +180,7 @@ DATASETS: tuple[DatasetSpec, ...] = (
                   NULLIF(BTRIM(a.zip_code), ''),
                   NULLIF(BTRIM(sd_sub.zip_code::text), '')
                 ) AS postal_code,
+                returns.return_received_at,
                 o.subtotal AS subtotal_amount,
                 o.discount_amount,
                 o.shipping_fee AS shipping_fee_amount,
@@ -177,7 +191,8 @@ DATASETS: tuple[DatasetSpec, ...] = (
                   o.updated_at,
                   COALESCE(c.updated_at, o.updated_at),
                   COALESCE(sd.updated_at, o.updated_at),
-                  COALESCE(a.updated_at, o.updated_at)
+                  COALESCE(a.updated_at, o.updated_at),
+                  COALESCE(returns.source_updated_at, o.updated_at)
                 ) AS source_updated_at
               FROM orders AS o
               LEFT JOIN customer AS c ON c.id = o.customer_id
@@ -185,6 +200,7 @@ DATASETS: tuple[DatasetSpec, ...] = (
               LEFT JOIN address AS a ON a.id = sd.shipping_address_id
               LEFT JOIN "Province" AS p ON p.id = a.province_id
               LEFT JOIN "Subdistrict" AS sd_sub ON sd_sub.id = a.subdistrict_id
+              LEFT JOIN return_receipts AS returns ON returns.orders_id = o.id
             )
             SELECT *
             FROM order_extract

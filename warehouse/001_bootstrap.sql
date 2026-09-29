@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS dw.fact_order (
   delivered_date_key INTEGER REFERENCES dw.dim_date(date_key),
   delivery_timestamp_source TEXT
     CHECK (delivery_timestamp_source IN ('HISTORY', 'ORDER_UPDATED_AT_ESTIMATE')),
+  return_received_at TIMESTAMPTZ,
   subtotal_amount NUMERIC(18, 2) NOT NULL DEFAULT 0,
   discount_amount NUMERIC(18, 2) NOT NULL DEFAULT 0,
   shipping_fee_amount NUMERIC(18, 2) NOT NULL DEFAULT 0,
@@ -212,6 +213,7 @@ ALTER TABLE dw.fact_order ADD COLUMN IF NOT EXISTS buyer_name TEXT;
 ALTER TABLE dw.fact_order ADD COLUMN IF NOT EXISTS province_name TEXT;
 ALTER TABLE dw.fact_order ADD COLUMN IF NOT EXISTS postal_code TEXT;
 ALTER TABLE dw.fact_order ADD COLUMN IF NOT EXISTS customer_key BIGINT DEFAULT 0;
+ALTER TABLE dw.fact_order ADD COLUMN IF NOT EXISTS return_received_at TIMESTAMPTZ;
 
 CREATE OR REPLACE FUNCTION etl.backfill_customer_dimension()
 RETURNS void
@@ -409,6 +411,7 @@ CREATE TABLE IF NOT EXISTS stg.orders (
   buyer_name TEXT,
   province_name TEXT,
   postal_code TEXT,
+  return_received_at TIMESTAMPTZ,
   subtotal_amount NUMERIC(18, 2) NOT NULL DEFAULT 0,
   discount_amount NUMERIC(18, 2) NOT NULL DEFAULT 0,
   shipping_fee_amount NUMERIC(18, 2) NOT NULL DEFAULT 0,
@@ -423,6 +426,7 @@ ALTER TABLE stg.orders ADD COLUMN IF NOT EXISTS buyer_source_id BIGINT;
 ALTER TABLE stg.orders ADD COLUMN IF NOT EXISTS buyer_name TEXT;
 ALTER TABLE stg.orders ADD COLUMN IF NOT EXISTS province_name TEXT;
 ALTER TABLE stg.orders ADD COLUMN IF NOT EXISTS postal_code TEXT;
+ALTER TABLE stg.orders ADD COLUMN IF NOT EXISTS return_received_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS stg.order_status_history (
   batch_id UUID NOT NULL REFERENCES etl.load_batch(batch_id),

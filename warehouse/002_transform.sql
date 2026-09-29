@@ -120,15 +120,27 @@ BEGIN
       source_system, order_source_id, order_number, order_at, order_date_key, channel_key,
       customer_key, buyer_source_id, buyer_name, province_name, postal_code,
       current_status, is_cancelled, is_deleted, delivered_at, delivered_date_key,
-      delivery_timestamp_source, subtotal_amount, discount_amount, shipping_fee_amount,
+      delivery_timestamp_source, return_received_at, subtotal_amount, discount_amount, shipping_fee_amount,
       tax_amount, total_amount, source_updated_at, last_loaded_batch_id
     )
     WITH delivered_history AS (
-      SELECT order_source_id, MIN(occurred_at) AS delivered_at
-      FROM stg.order_status_history
-      WHERE stg.order_status_history.batch_id = p_batch_id
-        AND LOWER(BTRIM(new_status)) = 'delivered'
-      GROUP BY order_source_id
+      SELECT history.order_source_id, MIN(history.occurred_at) AS delivered_at
+      FROM stg.order_status_history AS history
+      JOIN stg.orders AS staged_order
+        ON staged_order.batch_id = p_batch_id
+       AND staged_order.source_id = history.order_source_id
+      LEFT JOIN dw.dim_channel AS history_channel
+        ON history_channel.source_system = v_batch.source_system
+       AND history_channel.channel_source_id = staged_order.channel_source_id
+      WHERE history.batch_id = p_batch_id
+        AND (
+          LOWER(BTRIM(history.new_status)) = 'delivered'
+          OR (
+            UPPER(BTRIM(history_channel.channel_code)) = 'POS'
+            AND LOWER(BTRIM(history.new_status)) = 'completed'
+          )
+        )
+      GROUP BY history.order_source_id
     )
     SELECT
       v_batch.source_system, o.source_id, o.order_number, o.order_at, etl.date_key(o.order_at),
@@ -136,12 +148,23 @@ BEGIN
       o.buyer_source_id, o.buyer_name, o.province_name, o.postal_code,
       o.current_status,
       LOWER(BTRIM(o.current_status)) = 'cancelled', o.deleted_at IS NOT NULL,
-      COALESCE(h.delivered_at, CASE WHEN LOWER(BTRIM(o.current_status)) = 'delivered' THEN o.source_updated_at END),
-      etl.date_key(COALESCE(h.delivered_at, CASE WHEN LOWER(BTRIM(o.current_status)) = 'delivered' THEN o.source_updated_at END)),
+      COALESCE(h.delivered_at, CASE
+        WHEN LOWER(BTRIM(o.current_status)) = 'delivered' THEN o.source_updated_at
+        WHEN UPPER(BTRIM(channel.channel_code)) = 'POS'
+          AND LOWER(BTRIM(o.current_status)) = 'completed' THEN o.order_at
+      END),
+      etl.date_key(COALESCE(h.delivered_at, CASE
+        WHEN LOWER(BTRIM(o.current_status)) = 'delivered' THEN o.source_updated_at
+        WHEN UPPER(BTRIM(channel.channel_code)) = 'POS'
+          AND LOWER(BTRIM(o.current_status)) = 'completed' THEN o.order_at
+      END)),
       CASE
         WHEN h.delivered_at IS NOT NULL THEN 'HISTORY'
         WHEN LOWER(BTRIM(o.current_status)) = 'delivered' THEN 'ORDER_UPDATED_AT_ESTIMATE'
+        WHEN UPPER(BTRIM(channel.channel_code)) = 'POS'
+          AND LOWER(BTRIM(o.current_status)) = 'completed' THEN 'ORDER_UPDATED_AT_ESTIMATE'
       END,
+      o.return_received_at,
       o.subtotal_amount, o.discount_amount, o.shipping_fee_amount, o.tax_amount,
       o.total_amount, o.source_updated_at, p_batch_id
     FROM stg.orders AS o
@@ -180,6 +203,11 @@ BEGIN
         WHEN dw.fact_order.delivery_timestamp_source IS NULL THEN EXCLUDED.delivery_timestamp_source
         ELSE dw.fact_order.delivery_timestamp_source
       END,
+      return_received_at = CASE
+        WHEN dw.fact_order.return_received_at IS NULL THEN EXCLUDED.return_received_at
+        WHEN EXCLUDED.return_received_at IS NULL THEN dw.fact_order.return_received_at
+        ELSE LEAST(dw.fact_order.return_received_at, EXCLUDED.return_received_at)
+      END,
       subtotal_amount = EXCLUDED.subtotal_amount,
       discount_amount = EXCLUDED.discount_amount,
       shipping_fee_amount = EXCLUDED.shipping_fee_amount,
@@ -189,13 +217,24 @@ BEGIN
       last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
     WHERE EXCLUDED.source_updated_at >= dw.fact_order.source_updated_at;
 
-    -- A delivered event can arrive after the order row; retain the earliest authoritative event.
+    -- Delivery can arrive after the order row. POS completion is immediate handover.
     WITH delivered_history AS (
-      SELECT order_source_id, MIN(occurred_at) AS delivered_at
-      FROM stg.order_status_history
-      WHERE stg.order_status_history.batch_id = p_batch_id
-        AND LOWER(BTRIM(new_status)) = 'delivered'
-      GROUP BY order_source_id
+      SELECT history.order_source_id, MIN(history.occurred_at) AS delivered_at
+      FROM stg.order_status_history AS history
+      JOIN dw.fact_order AS existing_order
+        ON existing_order.source_system = v_batch.source_system
+       AND existing_order.order_source_id = history.order_source_id
+      JOIN dw.dim_channel AS history_channel
+        ON history_channel.channel_key = existing_order.channel_key
+      WHERE history.batch_id = p_batch_id
+        AND (
+          LOWER(BTRIM(history.new_status)) = 'delivered'
+          OR (
+            UPPER(BTRIM(history_channel.channel_code)) = 'POS'
+            AND LOWER(BTRIM(history.new_status)) = 'completed'
+          )
+        )
+      GROUP BY history.order_source_id
     )
     UPDATE dw.fact_order AS f
     SET delivered_at = CASE
