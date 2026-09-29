@@ -118,6 +118,23 @@ retries failures up to three times per hour; the ETL's PostgreSQL advisory lock
 still prevents overlapping warehouse runs. Inspect failures with
 `journalctl -u data-engineering.service`.
 
+### Automatic production deployment
+
+A push to `main` tests the pipeline and warehouse SQL, publishes an immutable
+digest-pinned image, then deploys it through `deploy/scripts/deploy.sh`. Changes
+under `etl/` or `warehouse/` run a full backfill; other changes run incremental
+ETL. The deployment stops the timer, backs up `warehouse_db`, applies warehouse
+SQL `001` through `003`, runs `check`, runs the selected ETL mode, reconciles
+completed physical returns, and restores the timer. It never runs
+`004_verify.sql` in production.
+
+Configure a protected GitHub `production` environment with `VPS_HOST`,
+`VPS_PORT`, `VPS_USER`, `VPS_SSH_KEY`, and `VPS_KNOWN_HOSTS`. The VPS deployment
+user must have Docker access and narrowly scoped passwordless permission to
+start and stop `data-engineering.timer` when it is not root. The VPS must
+already contain the production Compose and environment files described above
+and be authenticated to GHCR when the image is private.
+
 ## Local development
 
 ```powershell

@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: data-engineering-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -16,6 +16,9 @@ permissions:
 jobs:
   test-and-build:
     runs-on: ubuntu-24.04
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      run_mode: ${{ steps.deploy-mode.outputs.mode }}
     services:
       postgres:
         image: postgres:16-bookworm
@@ -31,6 +34,8 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -44,6 +49,21 @@ jobs:
           for file in warehouse/001_bootstrap.sql warehouse/002_transform.sql warehouse/003_marts.sql warehouse/004_verify.sql; do
             psql -h 127.0.0.1 -U postgres -d warehouse_db_test -v ON_ERROR_STOP=1 -f "$file"
           done
+      - name: Select deployed ETL mode
+        id: deploy-mode
+        if: github.event_name == 'push'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          mode=full
+          if [[ ! "$BEFORE_SHA" =~ ^0+$ ]] && git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            if git diff --quiet "$BEFORE_SHA" "$CURRENT_SHA" -- etl warehouse; then
+              mode=incremental
+            fi
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Production ETL mode: $mode"
       - uses: docker/setup-buildx-action@v3
       - if: github.event_name == 'push'
         uses: docker/login-action@v3
@@ -60,3 +80,49 @@ jobs:
           build-args: VCS_REF=${{ github.sha }}
       - if: github.event_name == 'push'
         run: echo 'ETL_IMAGE=ghcr.io/phum164/etl-pipeline@${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy ETL to production
+    if: github.event_name == 'push'
+    needs: test-and-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    environment:
+      name: production
+    concurrency:
+      group: production-etl
+      cancel-in-progress: false
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          if ! ssh-keygen -y -P '' -f "$HOME/.ssh/id_ed25519" >/dev/null 2>&1; then
+            echo "::error::VPS_SSH_KEY must contain the complete unencrypted private key"
+            exit 1
+          fi
+          printf '%s\n' "$VPS_KNOWN_HOSTS" | tr -d '\r' > "$HOME/.ssh/known_hosts"
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+      - name: Deploy immutable image and refresh warehouse
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          IMAGE_DIGEST: ${{ needs.test-and-build.outputs.image_digest }}
+          RUN_MODE: ${{ needs.test-and-build.outputs.run_mode }}
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -p "${VPS_PORT:-22}" \
+            "${VPS_USER}@${VPS_HOST}" \
+            "bash -s -- '$IMAGE_DIGEST' '$RUN_MODE'" \
+            < deploy/scripts/deploy.sh
