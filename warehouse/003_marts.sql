@@ -198,3 +198,78 @@ FROM dw.fact_channel_inventory_daily_snapshot AS i
 JOIN dw.dim_date AS d ON d.date_key = i.snapshot_date_key
 JOIN dw.dim_sku AS s ON s.sku_key = i.sku_key
 JOIN dw.dim_channel AS c ON c.channel_key = i.channel_key;
+
+-- Revenue by directly assigned product category and product. Historical sales
+-- use the SKU's current category; delivery date is the cohort and the gross
+-- delivered population is retained even when the order is later cancelled,
+-- refunded, or returned. Line subtotals are after line-level discounts.
+CREATE OR REPLACE VIEW mart.v_delivered_product_category_daily AS
+SELECT
+  d.calendar_date AS business_date,
+  c.channel_code,
+  s.category_source_id,
+  COALESCE(s.category_name, 'ไม่ระบุหมวดหมู่'::TEXT) AS category_name,
+  s.product_source_id,
+  s.product_name,
+  SUM(l.quantity)::BIGINT AS units_sold,
+  COALESCE(SUM(l.line_subtotal_amount), 0)::NUMERIC(18, 2) AS line_subtotal_amount
+FROM dw.fact_order_line AS l
+JOIN dw.fact_order AS o ON o.order_key = l.order_key
+JOIN dw.dim_date AS d ON d.date_key = o.delivered_date_key
+JOIN dw.dim_channel AS c ON c.channel_key = o.channel_key
+JOIN dw.dim_sku AS s ON s.sku_key = l.sku_key
+WHERE o.delivered_date_key IS NOT NULL
+  AND NOT o.is_deleted
+  AND NOT l.is_deleted
+GROUP BY
+  d.calendar_date, c.channel_code, s.category_source_id, s.category_name,
+  s.product_source_id, s.product_name;
+
+-- Same delivered gross population as category revenue, at SKU grain. Keep
+-- variants separate by stable SKU identity, not mutable codes/attributes.
+CREATE OR REPLACE VIEW mart.v_delivered_sku_daily AS
+SELECT
+  d.calendar_date AS business_date,
+  c.channel_code,
+  s.product_source_id,
+  s.product_name,
+  s.sku_source_id,
+  s.sku_code,
+  s.attribute_value,
+  s.size_value,
+  SUM(l.quantity)::BIGINT AS units_sold,
+  COALESCE(SUM(l.line_subtotal_amount), 0)::NUMERIC(18, 2) AS line_subtotal_amount
+FROM dw.fact_order_line AS l
+JOIN dw.fact_order AS o ON o.order_key = l.order_key
+JOIN dw.dim_date AS d ON d.date_key = o.delivered_date_key
+JOIN dw.dim_channel AS c ON c.channel_key = o.channel_key
+JOIN dw.dim_sku AS s ON s.sku_key = l.sku_key
+WHERE o.delivered_date_key IS NOT NULL
+  AND NOT o.is_deleted
+  AND NOT l.is_deleted
+GROUP BY
+  d.calendar_date, c.channel_code, s.product_source_id, s.product_name,
+  s.sku_source_id, s.sku_code, s.attribute_value, s.size_value;
+
+-- One current row per Facebook order with retained CF evidence. snapshot_as_of
+-- is the source cutoff of the most recent successful ETL, not wall-clock time.
+CREATE OR REPLACE VIEW mart.v_social_order_status AS
+SELECT
+  f.order_source_id,
+  f.cf_at,
+  f.payment_due_at,
+  f.required_amount,
+  f.confirmed_paid_amount,
+  f.paid_in_full_at,
+  f.is_cod,
+  f.is_cancelled,
+  f.is_data_complete,
+  f.is_deleted,
+  COALESCE(snapshot.source_window_ended_at, f.snapshot_as_of) AS snapshot_as_of
+FROM dw.fact_social_order AS f
+LEFT JOIN LATERAL (
+  SELECT MAX(batch.source_window_ended_at) AS source_window_ended_at
+  FROM etl.load_batch AS batch
+  WHERE batch.source_system = f.source_system
+    AND batch.status IN ('SUCCEEDED', 'SUCCEEDED_WITH_REJECTS')
+) AS snapshot ON TRUE;
