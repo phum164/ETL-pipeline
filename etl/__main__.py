@@ -5,12 +5,12 @@ import logging
 import sys
 
 from .config import Settings
-from .pipeline import check_connections, run_pipeline
+from .pipeline import check_connections, reconcile_warehouse, run_pipeline
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Warehouse Sales-Stock Data ETL")
-    parser.add_argument("command", choices=("check", "full", "incremental"))
+    parser.add_argument("command", choices=("check", "full", "incremental", "reconcile"))
     args = parser.parse_args()
 
     try:
@@ -28,6 +28,13 @@ def main() -> int:
     if args.command == "check":
         check_connections(settings)
         logging.getLogger("warehouse_db_etl").info("source and warehouse contracts are ready")
+        return 0
+    if args.command == "reconcile":
+        try:
+            reconcile_warehouse(settings)
+        except Exception as error:
+            logging.getLogger("warehouse_db_etl").error("reconciliation failed: %s", error)
+            return 1
         return 0
     return run_pipeline(settings, args.command)
 

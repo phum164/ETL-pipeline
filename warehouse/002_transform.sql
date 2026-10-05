@@ -251,6 +251,63 @@ BEGIN
     WHERE f.source_system = v_batch.source_system
       AND f.order_source_id = h.order_source_id;
 
+    INSERT INTO dw.fact_facebook_reserve (
+      source_system, reserve_source_id, order_source_id, created_at, reserved_until,
+      status, is_deleted, source_updated_at, last_loaded_batch_id
+    )
+    SELECT
+      v_batch.source_system, source_id, order_source_id, created_at, reserved_until,
+      status, deleted_at IS NOT NULL, source_updated_at, p_batch_id
+    FROM stg.facebook_reserves
+    WHERE stg.facebook_reserves.batch_id = p_batch_id
+    ON CONFLICT (source_system, reserve_source_id) DO UPDATE SET
+      order_source_id = EXCLUDED.order_source_id,
+      created_at = EXCLUDED.created_at,
+      reserved_until = EXCLUDED.reserved_until,
+      status = EXCLUDED.status,
+      is_deleted = EXCLUDED.is_deleted,
+      source_updated_at = EXCLUDED.source_updated_at,
+      last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
+    WHERE EXCLUDED.source_updated_at >= dw.fact_facebook_reserve.source_updated_at;
+
+    INSERT INTO dw.fact_payment_transaction (
+      source_system, payment_source_id, order_source_id, amount, current_status,
+      payment_at, verified_at, is_deleted, source_updated_at, last_loaded_batch_id
+    )
+    SELECT
+      v_batch.source_system, source_id, order_source_id, amount, current_status,
+      payment_at, verified_at, deleted_at IS NOT NULL, source_updated_at, p_batch_id
+    FROM stg.payment_transactions
+    WHERE stg.payment_transactions.batch_id = p_batch_id
+    ON CONFLICT (source_system, payment_source_id) DO UPDATE SET
+      order_source_id = EXCLUDED.order_source_id,
+      amount = EXCLUDED.amount,
+      current_status = EXCLUDED.current_status,
+      payment_at = EXCLUDED.payment_at,
+      verified_at = EXCLUDED.verified_at,
+      is_deleted = EXCLUDED.is_deleted,
+      source_updated_at = EXCLUDED.source_updated_at,
+      last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
+    WHERE EXCLUDED.source_updated_at >= dw.fact_payment_transaction.source_updated_at;
+
+    INSERT INTO dw.fact_order_status_event (
+      source_system, event_source_id, order_source_id, new_status, action,
+      occurred_at, source_updated_at, last_loaded_batch_id
+    )
+    SELECT
+      v_batch.source_system, source_id, order_source_id, new_status, action,
+      occurred_at, source_updated_at, p_batch_id
+    FROM stg.order_status_history
+    WHERE stg.order_status_history.batch_id = p_batch_id
+    ON CONFLICT (source_system, event_source_id) DO UPDATE SET
+      order_source_id = EXCLUDED.order_source_id,
+      new_status = EXCLUDED.new_status,
+      action = EXCLUDED.action,
+      occurred_at = EXCLUDED.occurred_at,
+      source_updated_at = EXCLUDED.source_updated_at,
+      last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
+    WHERE EXCLUDED.source_updated_at >= dw.fact_order_status_event.source_updated_at;
+
     INSERT INTO etl.rejected_row (batch_id, entity_name, source_id, reason, payload)
     SELECT
       p_batch_id, 'order_lines', l.source_id, 'Missing parent order or SKU dimension',
@@ -382,6 +439,166 @@ BEGIN
       last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
     WHERE EXCLUDED.captured_at >= dw.fact_channel_inventory_daily_snapshot.captured_at;
 
+    -- The immutable reserve deadline is the source of the 24-hour cohort.
+    -- Invalid or missing deadlines remain as undated, incomplete facts.
+    WITH reserve_summary AS (
+      SELECT
+        source_system,
+        order_source_id,
+        MIN(created_at) AS first_reserve_at,
+        MIN(reserved_until) AS earliest_due_at,
+        MAX(reserved_until) AS latest_due_at,
+        COUNT(*) FILTER (WHERE reserved_until IS NULL) AS missing_due_count,
+        COUNT(*) AS linked_reserve_count
+      FROM dw.fact_facebook_reserve
+      WHERE source_system = v_batch.source_system
+        AND order_source_id IS NOT NULL
+      GROUP BY source_system, order_source_id
+    ), payment_totals AS (
+      SELECT
+        source_system,
+        order_source_id,
+        COALESCE(SUM(amount) FILTER (
+          WHERE LOWER(BTRIM(current_status)) = 'completed'
+            AND NOT is_deleted
+            AND amount > 0
+        ), 0)::NUMERIC(18, 2) AS confirmed_paid_amount,
+        COALESCE(BOOL_OR(
+          LOWER(BTRIM(current_status)) = 'completed'
+          AND NOT is_deleted
+          AND amount > 0
+          AND verified_at IS NULL
+        ), FALSE) AS has_untimed_completed_payment,
+        COALESCE(BOOL_OR(
+          LOWER(BTRIM(current_status)) = 'refunded'
+          AND verified_at IS NOT NULL
+        ), FALSE) AS has_refund_evidence
+      FROM dw.fact_payment_transaction
+      WHERE source_system = v_batch.source_system
+      GROUP BY source_system, order_source_id
+    ), paid_steps AS (
+      SELECT
+        payment.source_system,
+        payment.order_source_id,
+        payment.verified_at,
+        orders.total_amount AS required_amount,
+        SUM(payment.amount) OVER (
+          PARTITION BY payment.source_system, payment.order_source_id
+          ORDER BY payment.verified_at, payment.payment_source_id
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cumulative_paid_amount
+      FROM dw.fact_payment_transaction AS payment
+      JOIN dw.fact_order AS orders
+        ON orders.source_system = payment.source_system
+       AND orders.order_source_id = payment.order_source_id
+      WHERE payment.source_system = v_batch.source_system
+        AND LOWER(BTRIM(payment.current_status)) = 'completed'
+        AND NOT payment.is_deleted
+        AND payment.amount > 0
+        AND payment.verified_at IS NOT NULL
+    ), paid_in_full AS (
+      SELECT
+        source_system,
+        order_source_id,
+        MIN(verified_at) FILTER (
+          WHERE cumulative_paid_amount >= required_amount
+        ) AS paid_in_full_at
+      FROM paid_steps
+      GROUP BY source_system, order_source_id
+    ), order_status_signals AS (
+      SELECT
+        source_system,
+        order_source_id,
+        BOOL_OR(LOWER(BTRIM(new_status)) = 'cod') AS has_cod_history,
+        BOOL_OR(LOWER(BTRIM(new_status)) = 'paid') AS has_paid_history
+      FROM dw.fact_order_status_event
+      WHERE source_system = v_batch.source_system
+      GROUP BY source_system, order_source_id
+    ), social_orders AS (
+      SELECT
+        orders.source_system,
+        orders.order_source_id,
+        CASE
+          WHEN reserves.missing_due_count = 0
+            AND reserves.linked_reserve_count > 0
+            AND reserves.earliest_due_at = reserves.latest_due_at
+            AND reserves.earliest_due_at >= reserves.first_reserve_at + INTERVAL '24 hours'
+          THEN reserves.earliest_due_at - INTERVAL '24 hours'
+        END AS cf_at,
+        CASE
+          WHEN reserves.missing_due_count = 0
+            AND reserves.linked_reserve_count > 0
+            AND reserves.earliest_due_at = reserves.latest_due_at
+            AND reserves.earliest_due_at >= reserves.first_reserve_at + INTERVAL '24 hours'
+          THEN reserves.earliest_due_at
+        END AS payment_due_at,
+        orders.total_amount AS required_amount,
+        COALESCE(payments.confirmed_paid_amount, 0)::NUMERIC(18, 2) AS confirmed_paid_amount,
+        paid.paid_in_full_at,
+        COALESCE(signals.has_cod_history, FALSE)
+          OR LOWER(BTRIM(orders.current_status)) = 'cod' AS is_cod,
+        orders.is_cancelled,
+        orders.is_deleted,
+        (
+          reserves.missing_due_count = 0
+          AND reserves.linked_reserve_count > 0
+          AND reserves.earliest_due_at = reserves.latest_due_at
+          AND reserves.earliest_due_at >= reserves.first_reserve_at + INTERVAL '24 hours'
+          AND orders.total_amount > 0
+          AND NOT COALESCE(payments.has_untimed_completed_payment, FALSE)
+          AND NOT (
+            COALESCE(payments.has_refund_evidence, FALSE)
+            AND paid.paid_in_full_at IS NULL
+          )
+          AND NOT (
+            (COALESCE(signals.has_paid_history, FALSE)
+              OR LOWER(BTRIM(orders.current_status)) = 'paid')
+            AND (
+              COALESCE(payments.confirmed_paid_amount, 0) < orders.total_amount
+              OR paid.paid_in_full_at IS NULL
+            )
+          )
+        ) AS is_data_complete
+      FROM dw.fact_order AS orders
+      JOIN dw.dim_channel AS channel ON channel.channel_key = orders.channel_key
+      JOIN reserve_summary AS reserves
+        ON reserves.source_system = orders.source_system
+       AND reserves.order_source_id = orders.order_source_id
+      LEFT JOIN payment_totals AS payments
+        ON payments.source_system = orders.source_system
+       AND payments.order_source_id = orders.order_source_id
+      LEFT JOIN paid_in_full AS paid
+        ON paid.source_system = orders.source_system
+       AND paid.order_source_id = orders.order_source_id
+      LEFT JOIN order_status_signals AS signals
+        ON signals.source_system = orders.source_system
+       AND signals.order_source_id = orders.order_source_id
+      WHERE orders.source_system = v_batch.source_system
+        AND UPPER(BTRIM(channel.channel_code)) IN ('FACEBOOK', 'FB', '1111')
+    )
+    INSERT INTO dw.fact_social_order (
+      source_system, order_source_id, cf_at, payment_due_at, required_amount,
+      confirmed_paid_amount, paid_in_full_at, is_cod, is_cancelled, is_deleted,
+      is_data_complete, snapshot_as_of, last_loaded_batch_id
+    )
+    SELECT
+      source_system, order_source_id, cf_at, payment_due_at, required_amount,
+      confirmed_paid_amount, paid_in_full_at, is_cod, is_cancelled, is_deleted,
+      is_data_complete, v_batch.source_window_ended_at, p_batch_id
+    FROM social_orders
+    ON CONFLICT (source_system, order_source_id) DO UPDATE SET
+      cf_at = EXCLUDED.cf_at,
+      payment_due_at = EXCLUDED.payment_due_at,
+      required_amount = EXCLUDED.required_amount,
+      confirmed_paid_amount = EXCLUDED.confirmed_paid_amount,
+      paid_in_full_at = EXCLUDED.paid_in_full_at,
+      is_cod = EXCLUDED.is_cod,
+      is_cancelled = EXCLUDED.is_cancelled,
+      is_deleted = EXCLUDED.is_deleted,
+      is_data_complete = EXCLUDED.is_data_complete,
+      snapshot_as_of = EXCLUDED.snapshot_as_of,
+      last_loaded_batch_id = EXCLUDED.last_loaded_batch_id;
+
     -- A rejected row keeps its entity watermark at the previous position. The
     -- next incremental run must replay that entity after its parent/dimension
     -- is repaired; advancing here would permanently skip the rejected row.
@@ -390,8 +607,10 @@ BEGIN
       FROM stg.sales_channels WHERE stg.sales_channels.batch_id = p_batch_id
       UNION ALL SELECT 'skus', source_updated_at, source_id FROM stg.skus WHERE stg.skus.batch_id = p_batch_id
       UNION ALL SELECT 'orders', source_updated_at, source_id FROM stg.orders WHERE stg.orders.batch_id = p_batch_id
-      UNION ALL SELECT 'order_status_history', occurred_at, source_id FROM stg.order_status_history WHERE stg.order_status_history.batch_id = p_batch_id
+      UNION ALL SELECT 'order_status_history', source_updated_at, source_id FROM stg.order_status_history WHERE stg.order_status_history.batch_id = p_batch_id
       UNION ALL SELECT 'order_lines', source_updated_at, source_id FROM stg.order_lines WHERE stg.order_lines.batch_id = p_batch_id
+      UNION ALL SELECT 'facebook_reserves', source_updated_at, source_id FROM stg.facebook_reserves WHERE stg.facebook_reserves.batch_id = p_batch_id
+      UNION ALL SELECT 'payment_transactions', source_updated_at, source_id FROM stg.payment_transactions WHERE stg.payment_transactions.batch_id = p_batch_id
       UNION ALL SELECT 'inventory_movements', movement_at, source_id FROM stg.inventory_movements WHERE stg.inventory_movements.batch_id = p_batch_id
       UNION ALL SELECT 'sku_on_channel', source_updated_at, sku_source_id FROM stg.sku_on_channel WHERE stg.sku_on_channel.batch_id = p_batch_id
     ), ranked_watermarks AS (
@@ -439,7 +658,10 @@ BEGIN
         'sales_channels', (SELECT COUNT(*) FROM stg.sales_channels WHERE stg.sales_channels.batch_id = p_batch_id),
         'skus', (SELECT COUNT(*) FROM stg.skus WHERE stg.skus.batch_id = p_batch_id),
         'orders', (SELECT COUNT(*) FROM stg.orders WHERE stg.orders.batch_id = p_batch_id),
+        'order_status_history', (SELECT COUNT(*) FROM stg.order_status_history WHERE stg.order_status_history.batch_id = p_batch_id),
         'order_lines', (SELECT COUNT(*) FROM stg.order_lines WHERE stg.order_lines.batch_id = p_batch_id),
+        'facebook_reserves', (SELECT COUNT(*) FROM stg.facebook_reserves WHERE stg.facebook_reserves.batch_id = p_batch_id),
+        'payment_transactions', (SELECT COUNT(*) FROM stg.payment_transactions WHERE stg.payment_transactions.batch_id = p_batch_id),
         'inventory_movements', (SELECT COUNT(*) FROM stg.inventory_movements WHERE stg.inventory_movements.batch_id = p_batch_id),
         'sku_on_channel', (SELECT COUNT(*) FROM stg.sku_on_channel WHERE stg.sku_on_channel.batch_id = p_batch_id),
         'rejected_rows', v_rejected_count

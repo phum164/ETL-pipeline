@@ -38,7 +38,15 @@ SOURCE_CONTRACTS: dict[str, tuple[str, ...]] = {
     "address": ("id", "name", "zip_code", "deleted_at", "updated_at", "province_id", "subdistrict_id"),
     "Province": ("id", "province"),
     "Subdistrict": ("id", "zip_code"),
-    "order_status_history": ("id", "orders_id", "new_status", "created_at"),
+    "order_status_history": ("id", "orders_id", "new_status", "action", "created_at"),
+    "facebook_reserves": (
+        "id", "order_id", "created_at", "reserved_until", "status", "deleted_at", "updated_at",
+    ),
+    "payment_transactions": (
+        "id", "orders_id", "amount", "status", "payment_date", "verified_at", "slip_checks_id",
+        "deleted_at", "updated_at",
+    ),
+    "slip_checks": ("id", "status", "checked_at", "updated_at"),
     "return_requests": ("id", "orders_id", "received_at", "updated_at"),
     "return_items": ("id", "return_requests_id", "received_quantity", "updated_at"),
     "order_details": (
@@ -64,7 +72,39 @@ WAREHOUSE_CONTRACTS: dict[tuple[str, str], tuple[str, ...]] = {
         "customer_key", "source_system", "customer_source_id", "customer_name",
         "latest_province_name", "latest_postal_code", "source_updated_at", "last_loaded_batch_id",
     ),
-    ("dw", "fact_order"): ("customer_key", "buyer_source_id", "province_name", "return_received_at"),
+    ("dw", "fact_order"): (
+        "customer_key", "buyer_source_id", "province_name", "return_received_at",
+    ),
+    ("dw", "fact_facebook_reserve"): (
+        "source_system", "reserve_source_id", "order_source_id", "created_at", "reserved_until",
+        "status", "is_deleted", "source_updated_at",
+    ),
+    ("dw", "fact_payment_transaction"): (
+        "source_system", "payment_source_id", "order_source_id", "amount", "current_status",
+        "payment_at", "verified_at", "is_deleted", "source_updated_at",
+    ),
+    ("dw", "fact_order_status_event"): (
+        "source_system", "event_source_id", "order_source_id", "new_status", "action",
+        "occurred_at", "source_updated_at",
+    ),
+    ("dw", "fact_social_order"): (
+        "source_system", "order_source_id", "cf_at", "payment_due_at", "required_amount",
+        "confirmed_paid_amount", "paid_in_full_at", "is_cod", "is_cancelled", "is_deleted",
+        "is_data_complete", "snapshot_as_of",
+    ),
+    ("mart", "v_delivered_product_category_daily"): (
+        "business_date", "channel_code", "category_source_id", "category_name",
+        "product_source_id", "product_name", "units_sold", "line_subtotal_amount",
+    ),
+    ("mart", "v_delivered_sku_daily"): (
+        "business_date", "channel_code", "product_source_id", "product_name",
+        "sku_source_id", "sku_code", "attribute_value", "size_value",
+        "units_sold", "line_subtotal_amount",
+    ),
+    ("mart", "v_social_order_status"): (
+        "order_source_id", "cf_at", "payment_due_at", "required_amount", "confirmed_paid_amount",
+        "paid_in_full_at", "is_cod", "is_cancelled", "is_data_complete", "is_deleted", "snapshot_as_of",
+    ),
 }
 
 
@@ -93,8 +133,8 @@ DATASETS: tuple[DatasetSpec, ...] = (
               code,
               name,
               deleted_at IS NULL AS is_active,
-              deleted_at,
-              updated_at AS source_updated_at
+              deleted_at AT TIME ZONE 'UTC' AS deleted_at,
+              updated_at AT TIME ZONE 'UTC' AS source_updated_at
             FROM sales_channels
             ORDER BY sales_id
         """,
@@ -131,8 +171,8 @@ DATASETS: tuple[DatasetSpec, ...] = (
               s.min_stock_level,
               (s.is_active AND p.is_active AND c.is_active
                 AND s.deleted_at IS NULL AND p.deleted_at IS NULL AND c.deleted_at IS NULL) AS is_active,
-              COALESCE(s.deleted_at, p.deleted_at, c.deleted_at) AS deleted_at,
-              GREATEST(s.updated_at, p.updated_at, c.updated_at) AS source_updated_at
+              COALESCE(s.deleted_at, p.deleted_at, c.deleted_at) AT TIME ZONE 'UTC' AS deleted_at,
+              GREATEST(s.updated_at, p.updated_at, c.updated_at) AT TIME ZONE 'UTC' AS source_updated_at
             FROM skus AS s
             JOIN products AS p ON p.id = s.products_id
             JOIN categories AS c ON c.category_id = p.categories_category_id
@@ -155,8 +195,11 @@ DATASETS: tuple[DatasetSpec, ...] = (
             WITH return_receipts AS (
               SELECT
                 rr.orders_id,
-                MIN(rr.received_at) AS return_received_at,
-                MAX(GREATEST(rr.updated_at, ri.updated_at)) AS source_updated_at
+                MIN(rr.received_at) AT TIME ZONE 'UTC' AS return_received_at,
+                MAX(GREATEST(
+                  rr.updated_at AT TIME ZONE 'UTC',
+                  ri.updated_at AT TIME ZONE 'UTC'
+                )) AS source_updated_at
               FROM return_requests AS rr
               JOIN return_items AS ri ON ri.return_requests_id = rr.id
               WHERE rr.received_at IS NOT NULL
@@ -166,7 +209,7 @@ DATASETS: tuple[DatasetSpec, ...] = (
               SELECT
                 o.id::bigint AS source_id,
                 o.order_number,
-                o.order_date AS order_at,
+                o.order_date AT TIME ZONE 'UTC' AS order_at,
                 o.status AS current_status,
                 o.sales_channels_sales_id::bigint AS channel_source_id,
                 o.customer_id::bigint AS buyer_source_id,
@@ -186,13 +229,13 @@ DATASETS: tuple[DatasetSpec, ...] = (
                 o.shipping_fee AS shipping_fee_amount,
                 o.tax_amount,
                 o.total_price AS total_amount,
-                o.deleted_at,
+                o.deleted_at AT TIME ZONE 'UTC' AS deleted_at,
                 GREATEST(
-                  o.updated_at,
-                  COALESCE(c.updated_at, o.updated_at),
-                  COALESCE(sd.updated_at, o.updated_at),
-                  COALESCE(a.updated_at, o.updated_at),
-                  COALESCE(returns.source_updated_at, o.updated_at)
+                  o.updated_at AT TIME ZONE 'UTC',
+                  COALESCE(c.updated_at AT TIME ZONE 'UTC', o.updated_at AT TIME ZONE 'UTC'),
+                  COALESCE(sd.updated_at AT TIME ZONE 'UTC', o.updated_at AT TIME ZONE 'UTC'),
+                  COALESCE(a.updated_at AT TIME ZONE 'UTC', o.updated_at AT TIME ZONE 'UTC'),
+                  COALESCE(returns.source_updated_at, o.updated_at AT TIME ZONE 'UTC')
                 ) AS source_updated_at
               FROM orders AS o
               LEFT JOIN customer AS c ON c.id = o.customer_id
@@ -212,19 +255,102 @@ DATASETS: tuple[DatasetSpec, ...] = (
     DatasetSpec(
         name="order_status_history",
         staging_table="order_status_history",
-        columns=("batch_id", "source_id", "order_source_id", "new_status", "occurred_at"),
-        required_columns=("source_id", "order_source_id", "new_status", "occurred_at"),
+        columns=(
+            "batch_id", "source_id", "order_source_id", "new_status", "action",
+            "occurred_at", "source_updated_at",
+        ),
+        required_columns=(
+            "source_id", "order_source_id", "new_status", "occurred_at", "source_updated_at",
+        ),
+        key_columns=("source_id",),
+        query="""
+            SELECT
+              history.id::bigint AS source_id,
+              history.orders_id::bigint AS order_source_id,
+              history.new_status,
+              history.action,
+              history.created_at AT TIME ZONE 'UTC' AS occurred_at,
+              GREATEST(
+                history.created_at AT TIME ZONE 'UTC',
+                orders.updated_at AT TIME ZONE 'UTC'
+              ) AS source_updated_at
+            FROM order_status_history AS history
+            JOIN orders ON orders.id = history.orders_id
+            WHERE (GREATEST(
+                     history.created_at AT TIME ZONE 'UTC',
+                     orders.updated_at AT TIME ZONE 'UTC'
+                   ), history.id) > (%(window_start)s, %(cursor_id)s)
+              AND GREATEST(
+                    history.created_at AT TIME ZONE 'UTC',
+                    orders.updated_at AT TIME ZONE 'UTC'
+                  ) <= %(window_end)s
+            ORDER BY source_updated_at, history.id
+        """,
+    ),
+    DatasetSpec(
+        name="facebook_reserves",
+        staging_table="facebook_reserves",
+        columns=(
+            "batch_id", "source_id", "order_source_id", "created_at", "reserved_until",
+            "status", "deleted_at", "source_updated_at",
+        ),
+        required_columns=("source_id", "created_at", "status", "source_updated_at"),
         key_columns=("source_id",),
         query="""
             SELECT
               id::bigint AS source_id,
-              orders_id::bigint AS order_source_id,
-              new_status,
-              created_at AS occurred_at
-            FROM order_status_history
-            WHERE (created_at, id) > (%(window_start)s, %(cursor_id)s)
-              AND created_at <= %(window_end)s
-            ORDER BY created_at, id
+              order_id::bigint AS order_source_id,
+              created_at AT TIME ZONE 'UTC' AS created_at,
+              reserved_until AT TIME ZONE 'UTC' AS reserved_until,
+              status,
+              deleted_at AT TIME ZONE 'UTC' AS deleted_at,
+              updated_at AT TIME ZONE 'UTC' AS source_updated_at
+            FROM facebook_reserves
+            WHERE (updated_at AT TIME ZONE 'UTC', id) > (%(window_start)s, %(cursor_id)s)
+              AND (updated_at AT TIME ZONE 'UTC') <= %(window_end)s
+            ORDER BY source_updated_at, id
+        """,
+    ),
+    DatasetSpec(
+        name="payment_transactions",
+        staging_table="payment_transactions",
+        columns=(
+            "batch_id", "source_id", "order_source_id", "amount", "current_status",
+            "payment_at", "verified_at", "deleted_at", "source_updated_at",
+        ),
+        required_columns=(
+            "source_id", "order_source_id", "amount", "current_status", "source_updated_at",
+        ),
+        key_columns=("source_id",),
+        query="""
+            SELECT
+              payment.id::bigint AS source_id,
+              payment.orders_id::bigint AS order_source_id,
+              payment.amount,
+              payment.status AS current_status,
+              payment.payment_date AT TIME ZONE 'UTC' AS payment_at,
+              COALESCE(
+                payment.verified_at AT TIME ZONE 'UTC',
+                CASE WHEN LOWER(BTRIM(slip_check.status)) = 'complete'
+                  THEN slip_check.checked_at AT TIME ZONE 'UTC'
+                END
+              ) AS verified_at,
+              payment.deleted_at AT TIME ZONE 'UTC' AS deleted_at,
+              GREATEST(
+                payment.updated_at AT TIME ZONE 'UTC',
+                COALESCE(slip_check.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC')
+              ) AS source_updated_at
+            FROM payment_transactions AS payment
+            LEFT JOIN slip_checks AS slip_check ON slip_check.id = payment.slip_checks_id
+            WHERE (GREATEST(
+                     payment.updated_at AT TIME ZONE 'UTC',
+                     COALESCE(slip_check.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC')
+                   ), payment.id) > (%(window_start)s, %(cursor_id)s)
+              AND GREATEST(
+                    payment.updated_at AT TIME ZONE 'UTC',
+                    COALESCE(slip_check.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC')
+                  ) <= %(window_end)s
+            ORDER BY source_updated_at, payment.id
         """,
     ),
     DatasetSpec(
@@ -249,11 +375,11 @@ DATASETS: tuple[DatasetSpec, ...] = (
               unit_price,
               discount AS line_discount_amount,
               subtotal AS line_subtotal_amount,
-              deleted_at,
-              updated_at AS source_updated_at
+              deleted_at AT TIME ZONE 'UTC' AS deleted_at,
+              updated_at AT TIME ZONE 'UTC' AS source_updated_at
             FROM order_details
-            WHERE (updated_at, id) > (%(window_start)s, %(cursor_id)s)
-              AND updated_at <= %(window_end)s
+            WHERE (updated_at AT TIME ZONE 'UTC', id) > (%(window_start)s, %(cursor_id)s)
+              AND (updated_at AT TIME ZONE 'UTC') <= %(window_end)s
             ORDER BY updated_at, id
         """,
     ),
@@ -276,7 +402,7 @@ DATASETS: tuple[DatasetSpec, ...] = (
             SELECT
               id::bigint AS source_id,
               skus_id::bigint AS sku_source_id,
-              created_at AS movement_at,
+              created_at AT TIME ZONE 'UTC' AS movement_at,
               on_hand_delta,
               reserved_delta,
               on_hand_before,
@@ -290,8 +416,8 @@ DATASETS: tuple[DatasetSpec, ...] = (
               reference_type,
               reference_id
             FROM inventory_movements
-            WHERE (created_at, id) > (%(window_start)s, %(cursor_id)s)
-              AND created_at <= %(window_end)s
+            WHERE (created_at AT TIME ZONE 'UTC', id) > (%(window_start)s, %(cursor_id)s)
+              AND (created_at AT TIME ZONE 'UTC') <= %(window_end)s
             ORDER BY created_at, id
         """,
     ),
@@ -322,8 +448,8 @@ DATASETS: tuple[DatasetSpec, ...] = (
               GREATEST(s.stock_quantity - s.reserved_quantity, 0) AS available_quantity,
               sc.inventory_dirty,
               (sc.is_active AND sc.deleted_at IS NULL) AS is_active,
-              sc.deleted_at,
-              GREATEST(sc.updated_at, s.updated_at) AS source_updated_at
+              sc.deleted_at AT TIME ZONE 'UTC' AS deleted_at,
+              GREATEST(sc.updated_at, s.updated_at) AT TIME ZONE 'UTC' AS source_updated_at
             FROM sku_on_channel AS sc
             JOIN skus AS s ON s.id = sc.skus_id
             ORDER BY sc.skus_id, sc.sales_channels_sales_id
@@ -345,7 +471,9 @@ def _python_value(value: Any) -> Any:
     except (TypeError, ValueError):
         pass
     if isinstance(value, pd.Timestamp):
-        return value.to_pydatetime()
+        value = value.to_pydatetime()
+    if isinstance(value, datetime) and value.tzinfo is None:
+        raise ValueError("ETL timestamp is timezone-naive; interpret the OLTP field as UTC in the extract")
     if hasattr(value, "item") and not isinstance(value, (str, bytes, Decimal)):
         value = value.item()
     if isinstance(value, float) and value.is_integer():
@@ -444,6 +572,20 @@ def _check_contracts(source: psycopg.Connection, target: psycopg.Connection) -> 
     )
     if source_missing:
         raise RuntimeError(f"OLTP source contract is missing: {', '.join(source_missing)}")
+
+    # AT TIME ZONE has opposite meanings for timestamp and timestamptz. Fail
+    # before loading if Prisma's UTC-naive source contract changes.
+    with source.cursor() as cursor:
+        cursor.execute("""
+            SELECT table_name, column_name, data_type
+            FROM information_schema.columns WHERE table_schema = 'public'
+        """)
+        types = {(table, column): kind for table, column, kind in cursor.fetchall()}
+    for table, columns in SOURCE_CONTRACTS.items():
+        for column in columns:
+            if column.endswith('_at') or column in {'order_date', 'payment_date', 'reserved_until'}:
+                if types.get((table, column)) != 'timestamp without time zone':
+                    raise RuntimeError(f"OLTP UTC timestamp contract changed: {table}.{column}")
 
     target_contracts = dict(WAREHOUSE_CONTRACTS)
     target_contracts.update(
@@ -545,7 +687,7 @@ def run_pipeline(settings: Settings, mode: str) -> int:
 
     batch_id = uuid.uuid4()
     batch_created = False
-    with psycopg.connect(settings.oltp_database_url) as source, psycopg.connect(settings.warehouse_database_url) as target:
+    with psycopg.connect(settings.oltp_database_url, options='-c timezone=UTC') as source, psycopg.connect(settings.warehouse_database_url, options='-c timezone=UTC') as target:
         pipeline_lock_acquired = False
         try:
             _acquire_pipeline_lock(target)
@@ -600,5 +742,105 @@ def run_pipeline(settings: Settings, mode: str) -> int:
 
 
 def check_connections(settings: Settings) -> None:
-    with psycopg.connect(settings.oltp_database_url) as source, psycopg.connect(settings.warehouse_database_url) as target:
+    with psycopg.connect(settings.oltp_database_url, options='-c timezone=UTC') as source, psycopg.connect(settings.warehouse_database_url, options='-c timezone=UTC') as target:
         _check_contracts(source, target)
+
+
+RECONCILE_SOURCE_SQL = """
+WITH receipts AS (
+  SELECT rr.orders_id, MIN(rr.received_at) AT TIME ZONE 'UTC' AS received_at,
+    MAX(GREATEST(rr.updated_at, ri.updated_at)) AT TIME ZONE 'UTC' AS updated_at
+  FROM return_requests rr JOIN return_items ri ON ri.return_requests_id = rr.id
+  WHERE rr.received_at IS NOT NULL AND ri.received_quantity > 0
+  GROUP BY rr.orders_id
+), expected AS (
+  SELECT o.id, COALESCE(sc.code, 'UNKNOWN') AS channel_code,
+    o.order_date AT TIME ZONE 'UTC' AS order_at,
+    COALESCE(h.delivered_at, CASE
+      WHEN LOWER(BTRIM(o.status)) = 'delivered' THEN
+        GREATEST(o.updated_at AT TIME ZONE 'UTC', c.updated_at AT TIME ZONE 'UTC',
+          sd.updated_at AT TIME ZONE 'UTC', a.updated_at AT TIME ZONE 'UTC', r.updated_at)
+      WHEN UPPER(BTRIM(sc.code)) = 'POS' AND LOWER(BTRIM(o.status)) = 'completed'
+        THEN o.order_date AT TIME ZONE 'UTC'
+    END) AS delivered_at,
+    r.received_at, LOWER(BTRIM(o.status)) = 'cancelled' AS is_cancelled,
+    o.deleted_at IS NOT NULL AS is_deleted, o.total_price
+  FROM orders o LEFT JOIN sales_channels sc ON sc.sales_id = o.sales_channels_sales_id
+  LEFT JOIN customer c ON c.id = o.customer_id
+  LEFT JOIN shipping_details sd ON sd.id = o.shipping_details_id
+  LEFT JOIN address a ON a.id = sd.shipping_address_id
+  LEFT JOIN receipts r ON r.orders_id = o.id
+  LEFT JOIN LATERAL (
+    SELECT MIN(history.created_at) AT TIME ZONE 'UTC' AS delivered_at
+    FROM order_status_history history WHERE history.orders_id = o.id
+      AND (LOWER(BTRIM(history.new_status)) = 'delivered'
+        OR (UPPER(BTRIM(sc.code)) = 'POS' AND LOWER(BTRIM(history.new_status)) = 'completed'))
+  ) h ON TRUE
+)
+SELECT id, channel_code, order_at, delivered_at, received_at, is_cancelled, is_deleted, total_price,
+  (order_at AT TIME ZONE 'Asia/Bangkok')::DATE,
+  (delivered_at AT TIME ZONE 'Asia/Bangkok')::DATE,
+  (received_at AT TIME ZONE 'Asia/Bangkok')::DATE
+FROM expected ORDER BY id
+"""
+
+RECONCILE_TARGET_SQL = """
+SELECT o.order_source_id, c.channel_code, o.order_at, o.delivered_at, o.return_received_at,
+  o.is_cancelled, o.is_deleted, o.total_amount, od.calendar_date, dd.calendar_date,
+  (o.return_received_at AT TIME ZONE 'Asia/Bangkok')::DATE
+FROM dw.fact_order o JOIN dw.dim_channel c ON c.channel_key = o.channel_key
+JOIN dw.dim_date od ON od.date_key = o.order_date_key
+LEFT JOIN dw.dim_date dd ON dd.date_key = o.delivered_date_key
+WHERE o.source_system = %s ORDER BY o.order_source_id
+"""
+
+
+def _assert_reconciled(source_rows: list[tuple], target_rows: list[tuple]) -> None:
+    expected = {row[0]: row[1:] for row in source_rows}
+    actual = {row[0]: row[1:] for row in target_rows}
+    mismatches = sum(expected.get(key) != actual.get(key) for key in expected.keys() | actual.keys())
+    if len(expected) != len(source_rows) or len(actual) != len(target_rows) or mismatches:
+        # Counts only: no customer identifiers or payment evidence in logs.
+        raise RuntimeError(f"Order/date/channel reconciliation failed: source={len(source_rows)} warehouse={len(target_rows)} mismatched={mismatches}")
+
+
+def _assert_delivery_evidence(source_rows: list[tuple], target_rows: list[tuple], unverifiable_estimates: int) -> None:
+    expected = {row[0]: row for row in source_rows}
+    missing_history = sum(row[3] is not None and row[0] in expected and expected[row[0]][3] is None
+                          for row in target_rows)
+    if missing_history or unverifiable_estimates:
+        raise RuntimeError('Delivery evidence is incomplete, not a proven timezone mismatch: '
+                           f'preserved_without_source_proof={missing_history} '
+                           f'non_pos_mutable_estimates={unverifiable_estimates}; '
+                           'review retained status history before release or rebuild')
+
+
+def reconcile_warehouse(settings: Settings) -> None:
+    """Read-only release gate. Concurrent OLTP changes fail closed; rerun ETL then retry."""
+    with psycopg.connect(settings.oltp_database_url, options='-c timezone=UTC') as source, psycopg.connect(settings.warehouse_database_url, options='-c timezone=UTC') as target:
+        source.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
+        target.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
+        _check_contracts(source, target)
+        status = target.execute("""
+            SELECT status FROM etl.load_batch WHERE source_system = %s
+            ORDER BY created_at DESC LIMIT 1
+        """, (settings.source_system,)).fetchone()
+        if status != ('SUCCEEDED',):
+            raise RuntimeError('Reconciliation requires the latest source batch to be SUCCEEDED')
+        expected = source.execute(RECONCILE_SOURCE_SQL).fetchall()
+        actual = target.execute(RECONCILE_TARGET_SQL, (settings.source_system,)).fetchall()
+        unverifiable = target.execute("""
+            SELECT COUNT(*) FROM dw.fact_order o
+            JOIN dw.dim_channel c ON c.channel_key = o.channel_key
+            WHERE o.source_system = %s AND o.delivered_at IS NOT NULL
+              AND o.delivery_timestamp_source = 'ORDER_UPDATED_AT_ESTIMATE'
+              AND UPPER(BTRIM(c.channel_code)) <> 'POS'
+        """, (settings.source_system,)).fetchone()[0]
+        _assert_delivery_evidence(expected, actual, unverifiable)
+        _assert_reconciled(expected, actual)
+        # Equality per order includes dates, channel, cancellation/deletion and
+        # exact decimal value, so all their daily gross totals agree as well.
+        delivered = [row for row in expected if row[3] is not None and not row[6]]
+        LOGGER.info('reconciled orders=%d delivered_orders=%d gross=%s physical_returns=%d',
+                    len(expected), len(delivered), sum((row[7] for row in delivered), Decimal('0')),
+                    sum(row[4] is not None for row in expected))

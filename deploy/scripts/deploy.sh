@@ -49,10 +49,16 @@ finish() {
     echo "Deployment failed; restoring previous ETL image reference." >&2
     cp "$PREVIOUS_ENV" "$RELEASE_ENV" || true
     chmod 600 "$RELEASE_ENV" || true
+    echo "Image rollback does not restore warehouse data. Review the backup before retrying." >&2
   fi
 
-  if [[ "$TIMER_WAS_ACTIVE" == "1" ]]; then
-    systemctl_write start data-engineering.timer || true
+  if [[ "$status" -eq 0 && "$TIMER_WAS_ACTIVE" == "1" ]]; then
+    if ! systemctl_write start data-engineering.timer; then
+      echo "Release checks passed, but restarting data-engineering.timer failed." >&2
+      status=1
+    fi
+  elif [[ "$status" -ne 0 && "$TIMER_WAS_ACTIVE" == "1" ]]; then
+    echo "Deployment failed; data-engineering.timer remains stopped. Reconcile or restore the warehouse before restarting it." >&2
   fi
 
   exit "$status"
@@ -78,6 +84,40 @@ current_database="$(
   exit 1
 }
 
+ANALYTICS_ROLE="$(awk -F= '$1 == "WAREHOUSE_ANALYTICS_ROLE" { print $2; exit }' "$RELEASE_ENV")"
+ANALYTICS_ROLE="${ANALYTICS_ROLE:-rm_analytics_reader}"
+[[ "$ANALYTICS_ROLE" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+  echo "WAREHOUSE_ANALYTICS_ROLE must be a PostgreSQL role name" >&2
+  exit 1
+}
+analytics_role_exists="$(
+  docker exec cfmanager-postgres sh -lc \
+    "psql -X -U \"\$POSTGRES_USER\" -d warehouse_db -Atc \"SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$ANALYTICS_ROLE');\""
+)"
+[[ "$analytics_role_exists" == "t" ]] || {
+  echo "Warehouse analytics role $ANALYTICS_ROLE does not exist; create it before deployment." >&2
+  exit 1
+}
+
+WRITER_ROLE="$(awk -F= '$1 == "WAREHOUSE_WRITER_ROLE" { print $2; exit }' "$RELEASE_ENV")"
+WRITER_ROLE="${WRITER_ROLE:-etl_writer}"
+[[ "$WRITER_ROLE" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+  echo "WAREHOUSE_WRITER_ROLE must be a PostgreSQL role name" >&2
+  exit 1
+}
+[[ "$WRITER_ROLE" != "$ANALYTICS_ROLE" ]] || {
+  echo "Warehouse writer and analytics reader must be different roles" >&2
+  exit 1
+}
+writer_role_exists="$(
+  docker exec cfmanager-postgres sh -lc \
+    "psql -X -U \"\$POSTGRES_USER\" -d warehouse_db -Atc \"SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$WRITER_ROLE');\""
+)"
+[[ "$writer_role_exists" == "t" ]] || {
+  echo "Warehouse writer role $WRITER_ROLE does not exist; create it before deployment." >&2
+  exit 1
+}
+
 mkdir -p "$BACKUP_ROOT"
 chmod 700 "$BACKUP_ROOT"
 backup_file="$BACKUP_ROOT/warehouse_db-before-etl-$(date -u +%Y%m%dT%H%M%SZ).dump"
@@ -85,6 +125,8 @@ docker exec cfmanager-postgres sh -lc \
   'pg_dump -Fc -U "$POSTGRES_USER" -d warehouse_db' > "$backup_file"
 [[ -s "$backup_file" ]] || { echo "Warehouse backup is empty" >&2; exit 1; }
 chmod 600 "$backup_file"
+docker exec -i cfmanager-postgres pg_restore --list < "$backup_file" >/dev/null
+docker exec -i cfmanager-postgres pg_restore --file=/dev/null < "$backup_file"
 echo "Warehouse backup: $backup_file"
 
 docker pull "$IMAGE" >/dev/null
@@ -112,6 +154,21 @@ for warehouse_sql in 001_bootstrap.sql 002_transform.sql 003_marts.sql; do
       'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d warehouse_db'
 done
 
+echo "Applying warehouse ETL writer grants for $WRITER_ROLE"
+docker exec -i cfmanager-postgres sh -lc \
+  "psql -X -v ON_ERROR_STOP=1 -v writer_role='$WRITER_ROLE' -U \"\$POSTGRES_USER\" -d warehouse_db" <<'SQL'
+GRANT USAGE ON SCHEMA etl, stg, dw, mart TO :"writer_role";
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA etl, stg, dw, mart TO :"writer_role";
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA etl, stg, dw, mart TO :"writer_role";
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA etl TO :"writer_role";
+SQL
+
+echo "Applying mart-only analytics grants for $ANALYTICS_ROLE"
+compose run --rm --no-deps --entrypoint cat \
+  warehouse-db-etl "/app/warehouse/005_analytics_readonly_grants.sql" |
+  docker exec -i cfmanager-postgres sh -lc \
+    "psql -X -v ON_ERROR_STOP=1 -v analytics_role='$ANALYTICS_ROLE' -U \"\$POSTGRES_USER\" -d warehouse_db"
+
 compose run --rm warehouse-db-etl check
 compose run --rm warehouse-db-etl "$RUN_MODE"
 
@@ -129,32 +186,12 @@ latest_status="$(
   exit 1
 }
 
-source_returned_orders="$(
-  docker exec cfmanager-postgres sh -lc \
-    'psql -X -U "$POSTGRES_USER" -d "${POSTGRES_DB:-cfmanager}" -Atc "
-      SELECT COUNT(DISTINCT rr.orders_id)
-      FROM return_requests AS rr
-      JOIN return_items AS ri ON ri.return_requests_id = rr.id
-      WHERE rr.received_at IS NOT NULL
-        AND ri.received_quantity > 0;
-    "'
-)"
-warehouse_returned_orders="$(
-  docker exec cfmanager-postgres sh -lc \
-    'psql -X -U "$POSTGRES_USER" -d warehouse_db -Atc "
-      SELECT COUNT(*)
-      FROM dw.fact_order
-      WHERE return_received_at IS NOT NULL;
-    "'
-)"
-[[ "$source_returned_orders" == "$warehouse_returned_orders" ]] || {
-  echo "Return reconciliation failed: source=$source_returned_orders warehouse=$warehouse_returned_orders" >&2
-  exit 1
-}
+echo "Reconciling source and warehouse order timestamps, Bangkok dates, channels, gross amounts, and physical returns"
+compose run --rm warehouse-db-etl reconcile
 
-printf '%s etl %s %s returned_orders=%s\n' \
-  "$(date -u +%FT%TZ)" "$IMAGE_DIGEST" "$RUN_MODE" "$warehouse_returned_orders" \
+printf '%s etl %s %s reconciliation=passed\n' \
+  "$(date -u +%FT%TZ)" "$IMAGE_DIGEST" "$RUN_MODE" \
   >> "$BASE_DIR/releases/deployments.log"
 
 RELEASE_CHANGED=0
-echo "ETL deployment completed: $IMAGE mode=$RUN_MODE returned_orders=$warehouse_returned_orders"
+echo "ETL deployment completed: $IMAGE mode=$RUN_MODE reconciliation=passed"
