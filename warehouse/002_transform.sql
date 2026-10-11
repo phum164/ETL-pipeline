@@ -252,16 +252,23 @@ BEGIN
       AND f.order_source_id = h.order_source_id;
 
     INSERT INTO dw.fact_facebook_reserve (
-      source_system, reserve_source_id, order_source_id, created_at, reserved_until,
-      status, is_deleted, source_updated_at, last_loaded_batch_id
+      source_system, reserve_source_id, order_source_id, keyword, sku_key, quantity,
+      created_at, reserved_until, status, is_deleted, source_updated_at, last_loaded_batch_id
     )
     SELECT
-      v_batch.source_system, source_id, order_source_id, created_at, reserved_until,
-      status, deleted_at IS NOT NULL, source_updated_at, p_batch_id
-    FROM stg.facebook_reserves
-    WHERE stg.facebook_reserves.batch_id = p_batch_id
+      v_batch.source_system, reserve.source_id, reserve.order_source_id, reserve.keyword,
+      sku.sku_key, reserve.quantity, reserve.created_at, reserve.reserved_until,
+      reserve.status, reserve.deleted_at IS NOT NULL, reserve.source_updated_at, p_batch_id
+    FROM stg.facebook_reserves AS reserve
+    LEFT JOIN dw.dim_sku AS sku
+      ON sku.source_system = v_batch.source_system
+     AND sku.sku_source_id = reserve.sku_source_id
+    WHERE reserve.batch_id = p_batch_id
     ON CONFLICT (source_system, reserve_source_id) DO UPDATE SET
       order_source_id = EXCLUDED.order_source_id,
+      keyword = EXCLUDED.keyword,
+      sku_key = EXCLUDED.sku_key,
+      quantity = EXCLUDED.quantity,
       created_at = EXCLUDED.created_at,
       reserved_until = EXCLUDED.reserved_until,
       status = EXCLUDED.status,
@@ -272,17 +279,21 @@ BEGIN
 
     INSERT INTO dw.fact_payment_transaction (
       source_system, payment_source_id, order_source_id, amount, current_status,
-      payment_at, verified_at, is_deleted, source_updated_at, last_loaded_batch_id
+      payment_method_source_id, payment_method_name, payment_at, verified_at,
+      is_deleted, source_updated_at, last_loaded_batch_id
     )
     SELECT
       v_batch.source_system, source_id, order_source_id, amount, current_status,
-      payment_at, verified_at, deleted_at IS NOT NULL, source_updated_at, p_batch_id
+      payment_method_source_id, payment_method_name, payment_at, verified_at,
+      deleted_at IS NOT NULL, source_updated_at, p_batch_id
     FROM stg.payment_transactions
     WHERE stg.payment_transactions.batch_id = p_batch_id
     ON CONFLICT (source_system, payment_source_id) DO UPDATE SET
       order_source_id = EXCLUDED.order_source_id,
       amount = EXCLUDED.amount,
       current_status = EXCLUDED.current_status,
+      payment_method_source_id = EXCLUDED.payment_method_source_id,
+      payment_method_name = EXCLUDED.payment_method_name,
       payment_at = EXCLUDED.payment_at,
       verified_at = EXCLUDED.verified_at,
       is_deleted = EXCLUDED.is_deleted,
@@ -291,11 +302,11 @@ BEGIN
     WHERE EXCLUDED.source_updated_at >= dw.fact_payment_transaction.source_updated_at;
 
     INSERT INTO dw.fact_order_status_event (
-      source_system, event_source_id, order_source_id, new_status, action,
+      source_system, event_source_id, order_source_id, new_status, action, reason,
       occurred_at, source_updated_at, last_loaded_batch_id
     )
     SELECT
-      v_batch.source_system, source_id, order_source_id, new_status, action,
+      v_batch.source_system, source_id, order_source_id, new_status, action, reason,
       occurred_at, source_updated_at, p_batch_id
     FROM stg.order_status_history
     WHERE stg.order_status_history.batch_id = p_batch_id
@@ -303,6 +314,7 @@ BEGIN
       order_source_id = EXCLUDED.order_source_id,
       new_status = EXCLUDED.new_status,
       action = EXCLUDED.action,
+      reason = EXCLUDED.reason,
       occurred_at = EXCLUDED.occurred_at,
       source_updated_at = EXCLUDED.source_updated_at,
       last_loaded_batch_id = EXCLUDED.last_loaded_batch_id

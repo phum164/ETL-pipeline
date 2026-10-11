@@ -364,6 +364,39 @@ Dashboard consumers should query only:
 - `mart.v_delivered_product_category_daily`
 - `mart.v_delivered_sku_daily`
 - `mart.v_social_order_status`
+- `mart.v_order_cohort_daily`
+- `mart.v_delivered_net_daily`
+- `mart.v_customer_profile`
+- `mart.v_customer_purchase_line`
+- `mart.v_product_customer_daily`
+- `mart.v_product_pair_daily`
+- `mart.v_product_stock_latest`
+- `mart.v_order_operational_detail`
+- `mart.v_order_cancellation`
+- `mart.v_social_order_action`
+- `mart.v_order_payment_method`
+- `mart.v_social_order_reserve`
+
+The ten Phase A views back the business-overview dashboard and its drill-downs.
+Their headers in `warehouse/003_marts.sql` define each grain. Key points:
+
+- `v_order_cohort_daily` and `v_delivered_net_daily` report delivered and
+  returned measures **net of cancellation**; the older daily/buyer/province marts
+  keep later-cancelled orders in `delivered_*` (gross). Only `booked_*`
+  reconciles one-to-one across all of them.
+- `customer_key = 0` (unknown / walk-in) stays in sums so marts reconcile; filter
+  `customer_key <> 0` for people counts. Customer identity is the local OLTP
+  customer id, not a verified unique person.
+- `v_customer_profile` is the only new view with a customer name (`buyer_name`
+  remains restricted personal data: mask it in the API and in exports).
+- `v_social_order_action` returns raw CF facts and an `is_eligible` flag only. The
+  API assesses overdue / paid-late with its own cutoff, exactly as it does for the
+  summary, so a list can never disagree with its rate.
+- `fulfillment_stage` in `v_order_operational_detail` follows the backend order
+  workflow vocabulary (`carrier_picked_up`, legacy `IN_TRANSIT`, ...). Confirm new
+  statuses against `dw.fact_order_status_event` before relying on it.
+- `v_product_stock_latest` is capture-time stock (not live); use
+  `stale_sku_count` to flag products whose SKUs were captured on different days.
 
 `v_delivered_product_category_daily` attributes delivered lines to the SKU's
 current directly assigned category, using delivery date and line subtotals after
@@ -408,6 +441,35 @@ them separately as undated instead of guessing a date-cohort. COD is identified 
 payment-method names are free text, so old COD records without status evidence
 remain a source-data limitation. `snapshot_as_of` is the latest successful
 source extraction cutoff, not the API server's current time.
+
+### Phase B: cancellation reason, payment method, and CF reserve detail
+
+`v_order_cancellation` now includes the latest available status-history reason.
+`v_order_payment_method` groups payment evidence by order and stable payment
+method ID; `v_social_order_reserve` exposes each CF key, quantity, and any
+resolved SKU/product. `reason`, payment-method names, and CF keywords are
+restricted free text from OLTP, not vetted codes. Keep them within authorized
+dashboard access and profile them before exporting or treating them as
+categories. No new Phase B view exposes a buyer or customer name.
+
+Adding these warehouse fields does not advance OLTP timestamps on unchanged
+source rows. The first deployment after this change must run ETL in `full` mode
+to backfill retained source rows. Automatic deployments already choose full
+mode for `etl/` or `warehouse/` changes; a manual `deploy.sh` run must use
+`full`, not incremental. A full replay can only fill rows still present in
+OLTP; values for purged or otherwise unavailable source rows remain NULL
+(unknown).
+
+Payment-method `updated_at` is included in the payment extraction timestamp so
+renamed methods refresh their transactions. `order_status_history` has no
+`updated_at`; incrementally refreshed reason edits rely on the parent order's
+`updated_at` being advanced.
+
+In `OrderWorkflowService.js`, `transition()` writes the optional `reason`
+argument to `order_status_history.reason`, or NULL when the caller omits it.
+`applyExternalStatus()` records external transitions without setting `reason`,
+and `createReturn()` uses the same field for its return reason type. The extracted
+field is therefore not guaranteed to be present or cancellation-specific.
 
 The `check` command validates every source table/column used by the extract
 queries and every staging/audit column required by the warehouse contract.

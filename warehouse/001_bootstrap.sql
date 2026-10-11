@@ -315,6 +315,9 @@ CREATE TABLE IF NOT EXISTS dw.fact_facebook_reserve (
   source_system TEXT NOT NULL,
   reserve_source_id BIGINT NOT NULL,
   order_source_id BIGINT,
+  keyword TEXT,
+  sku_key BIGINT REFERENCES dw.dim_sku(sku_key),
+  quantity INTEGER,
   created_at TIMESTAMPTZ NOT NULL,
   reserved_until TIMESTAMPTZ,
   status TEXT NOT NULL,
@@ -334,6 +337,8 @@ CREATE TABLE IF NOT EXISTS dw.fact_payment_transaction (
   order_source_id BIGINT NOT NULL,
   amount NUMERIC(18, 2) NOT NULL,
   current_status TEXT NOT NULL,
+  payment_method_source_id BIGINT,
+  payment_method_name TEXT,
   payment_at TIMESTAMPTZ,
   verified_at TIMESTAMPTZ,
   is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
@@ -352,6 +357,7 @@ CREATE TABLE IF NOT EXISTS dw.fact_order_status_event (
   order_source_id BIGINT NOT NULL,
   new_status TEXT NOT NULL,
   action TEXT,
+  reason TEXT,
   occurred_at TIMESTAMPTZ NOT NULL,
   source_updated_at TIMESTAMPTZ NOT NULL,
   last_loaded_batch_id UUID REFERENCES etl.load_batch(batch_id),
@@ -511,13 +517,17 @@ CREATE TABLE IF NOT EXISTS stg.order_status_history (
   order_source_id BIGINT NOT NULL,
   new_status TEXT NOT NULL,
   action TEXT,
+  reason TEXT,
   occurred_at TIMESTAMPTZ NOT NULL,
   source_updated_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (batch_id, source_id)
 );
 
 ALTER TABLE stg.order_status_history ADD COLUMN IF NOT EXISTS action TEXT;
+ALTER TABLE stg.order_status_history ADD COLUMN IF NOT EXISTS reason TEXT;
 ALTER TABLE stg.order_status_history ADD COLUMN IF NOT EXISTS source_updated_at TIMESTAMPTZ;
+
+ALTER TABLE dw.fact_order_status_event ADD COLUMN IF NOT EXISTS reason TEXT;
 
 CREATE TABLE IF NOT EXISTS stg.order_lines (
   batch_id UUID NOT NULL REFERENCES etl.load_batch(batch_id),
@@ -537,6 +547,9 @@ CREATE TABLE IF NOT EXISTS stg.facebook_reserves (
   batch_id UUID NOT NULL REFERENCES etl.load_batch(batch_id),
   source_id BIGINT NOT NULL,
   order_source_id BIGINT,
+  keyword TEXT,
+  sku_source_id BIGINT,
+  quantity INTEGER,
   created_at TIMESTAMPTZ NOT NULL,
   reserved_until TIMESTAMPTZ,
   status TEXT NOT NULL,
@@ -551,12 +564,26 @@ CREATE TABLE IF NOT EXISTS stg.payment_transactions (
   order_source_id BIGINT NOT NULL,
   amount NUMERIC(18, 2) NOT NULL,
   current_status TEXT NOT NULL,
+  payment_method_source_id BIGINT,
+  payment_method_name TEXT,
   payment_at TIMESTAMPTZ,
   verified_at TIMESTAMPTZ,
   deleted_at TIMESTAMPTZ,
   source_updated_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (batch_id, source_id)
 );
+
+ALTER TABLE stg.facebook_reserves ADD COLUMN IF NOT EXISTS keyword TEXT;
+ALTER TABLE stg.facebook_reserves ADD COLUMN IF NOT EXISTS sku_source_id BIGINT;
+ALTER TABLE stg.facebook_reserves ADD COLUMN IF NOT EXISTS quantity INTEGER;
+ALTER TABLE dw.fact_facebook_reserve ADD COLUMN IF NOT EXISTS keyword TEXT;
+ALTER TABLE dw.fact_facebook_reserve ADD COLUMN IF NOT EXISTS sku_key BIGINT REFERENCES dw.dim_sku(sku_key);
+ALTER TABLE dw.fact_facebook_reserve ADD COLUMN IF NOT EXISTS quantity INTEGER;
+
+ALTER TABLE stg.payment_transactions ADD COLUMN IF NOT EXISTS payment_method_source_id BIGINT;
+ALTER TABLE stg.payment_transactions ADD COLUMN IF NOT EXISTS payment_method_name TEXT;
+ALTER TABLE dw.fact_payment_transaction ADD COLUMN IF NOT EXISTS payment_method_source_id BIGINT;
+ALTER TABLE dw.fact_payment_transaction ADD COLUMN IF NOT EXISTS payment_method_name TEXT;
 
 CREATE TABLE IF NOT EXISTS stg.inventory_movements (
   batch_id UUID NOT NULL REFERENCES etl.load_batch(batch_id),

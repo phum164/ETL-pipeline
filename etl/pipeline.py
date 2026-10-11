@@ -38,14 +38,16 @@ SOURCE_CONTRACTS: dict[str, tuple[str, ...]] = {
     "address": ("id", "name", "zip_code", "deleted_at", "updated_at", "province_id", "subdistrict_id"),
     "Province": ("id", "province"),
     "Subdistrict": ("id", "zip_code"),
-    "order_status_history": ("id", "orders_id", "new_status", "action", "created_at"),
+    "order_status_history": ("id", "orders_id", "new_status", "action", "reason", "created_at"),
     "facebook_reserves": (
-        "id", "order_id", "created_at", "reserved_until", "status", "deleted_at", "updated_at",
+        "id", "order_id", "keyword", "skus_id", "quantity", "created_at", "reserved_until",
+        "status", "deleted_at", "updated_at",
     ),
     "payment_transactions": (
         "id", "orders_id", "amount", "status", "payment_date", "verified_at", "slip_checks_id",
-        "deleted_at", "updated_at",
+        "payment_methods_id", "deleted_at", "updated_at",
     ),
+    "payment_methods": ("id", "name", "updated_at"),
     "slip_checks": ("id", "status", "checked_at", "updated_at"),
     "return_requests": ("id", "orders_id", "received_at", "updated_at"),
     "return_items": ("id", "return_requests_id", "received_quantity", "updated_at"),
@@ -77,15 +79,16 @@ WAREHOUSE_CONTRACTS: dict[tuple[str, str], tuple[str, ...]] = {
     ),
     ("dw", "fact_facebook_reserve"): (
         "source_system", "reserve_source_id", "order_source_id", "created_at", "reserved_until",
-        "status", "is_deleted", "source_updated_at",
+        "status", "is_deleted", "source_updated_at", "keyword", "sku_key", "quantity",
     ),
     ("dw", "fact_payment_transaction"): (
         "source_system", "payment_source_id", "order_source_id", "amount", "current_status",
         "payment_at", "verified_at", "is_deleted", "source_updated_at",
+        "payment_method_source_id", "payment_method_name",
     ),
     ("dw", "fact_order_status_event"): (
         "source_system", "event_source_id", "order_source_id", "new_status", "action",
-        "occurred_at", "source_updated_at",
+        "occurred_at", "source_updated_at", "reason",
     ),
     ("dw", "fact_social_order"): (
         "source_system", "order_source_id", "cf_at", "payment_due_at", "required_amount",
@@ -104,6 +107,71 @@ WAREHOUSE_CONTRACTS: dict[tuple[str, str], tuple[str, ...]] = {
     ("mart", "v_social_order_status"): (
         "order_source_id", "cf_at", "payment_due_at", "required_amount", "confirmed_paid_amount",
         "paid_in_full_at", "is_cod", "is_cancelled", "is_data_complete", "is_deleted", "snapshot_as_of",
+    ),
+    ("mart", "v_order_cohort_daily"): (
+        "date_key", "business_date", "channel_key", "channel_code", "channel_name",
+        "order_count_all", "booked_order_count", "booked_sales_amount", "cancelled_order_count",
+        "cancelled_sales_amount", "delivered_order_count", "delivered_sales_amount",
+        "undelivered_order_count", "returned_order_count",
+    ),
+    ("mart", "v_delivered_net_daily"): (
+        "date_key", "business_date", "channel_key", "channel_code", "channel_name",
+        "delivered_order_count", "delivered_sales_amount", "delivered_estimated_timestamp_count",
+    ),
+    ("mart", "v_customer_profile"): (
+        "customer_key", "source_system", "buyer_source_id", "customer_name", "latest_province_name",
+        "latest_postal_code", "first_order_date", "last_order_date", "lifetime_order_count",
+        "lifetime_sales_amount", "first_channel_code", "channel_codes",
+    ),
+    ("mart", "v_customer_purchase_line"): (
+        "order_line_key", "order_key", "source_system", "order_source_id", "order_number", "order_at",
+        "date_key", "business_date", "channel_key", "channel_code", "channel_name", "customer_key",
+        "buyer_source_id", "province_name", "sku_key", "sku_source_id", "sku_code",
+        "product_source_id", "product_name", "category_source_id", "category_name", "attribute_value",
+        "size_value", "quantity", "unit_price", "line_discount_amount", "line_subtotal_amount",
+        "is_cancelled", "delivered_date_key", "is_delivered",
+    ),
+    ("mart", "v_product_customer_daily"): (
+        "date_key", "business_date", "channel_key", "channel_code", "channel_name",
+        "product_source_system", "product_source_id", "product_name", "customer_key",
+        "buyer_source_id", "province_name", "order_count", "units_sold", "line_subtotal_amount",
+    ),
+    ("mart", "v_product_pair_daily"): (
+        "date_key", "business_date", "channel_key", "channel_code", "channel_name",
+        "product_source_system", "product_a_source_id", "product_a_name", "product_b_source_id",
+        "product_b_name", "order_count",
+    ),
+    ("mart", "v_product_stock_latest"): (
+        "source_system", "product_source_id", "product_name", "sku_count", "out_of_stock_sku_count",
+        "stale_sku_count", "on_hand_quantity", "reserved_quantity", "available_quantity",
+        "oldest_snapshot_date_key", "snapshot_date_key", "oldest_captured_at", "captured_at",
+    ),
+    ("mart", "v_order_operational_detail"): (
+        "order_key", "source_system", "order_source_id", "order_number", "order_at", "date_key",
+        "business_date", "channel_key", "channel_code", "channel_name", "customer_key",
+        "buyer_source_id", "province_name", "current_status", "is_cancelled", "fulfillment_stage",
+        "subtotal_amount", "discount_amount", "shipping_fee_amount", "tax_amount", "total_amount",
+        "shipped_at", "delivered_at", "delivered_date_key", "delivery_timestamp_source",
+        "cancelled_at", "return_received_at",
+    ),
+    ("mart", "v_order_cancellation"): (
+        "order_key", "source_system", "order_source_id", "order_number", "order_at", "business_date",
+        "channel_code", "channel_name", "customer_key", "buyer_source_id", "total_amount",
+        "cancelled_at", "cancel_action", "cancel_reason",
+    ),
+    ("mart", "v_social_order_action"): (
+        "source_system", "order_source_id", "order_key", "order_number", "customer_key",
+        "buyer_source_id", "channel_code", "cf_at", "payment_due_at", "required_amount",
+        "confirmed_paid_amount", "outstanding_amount", "paid_in_full_at", "is_cod", "is_cancelled",
+        "is_data_complete", "is_eligible", "primary_product_source_id", "primary_product_name", "line_count",
+    ),
+    ("mart", "v_order_payment_method"): (
+        "order_key", "source_system", "order_source_id", "customer_key", "payment_method_source_id",
+        "payment_method_name", "confirmed_transaction_count", "confirmed_paid_amount", "first_verified_at",
+    ),
+    ("mart", "v_social_order_reserve"): (
+        "source_system", "reserve_source_id", "order_source_id", "keyword", "quantity", "reserve_status",
+        "created_at", "reserved_until", "sku_key", "sku_code", "product_source_id", "product_name",
     ),
 }
 
@@ -256,7 +324,7 @@ DATASETS: tuple[DatasetSpec, ...] = (
         name="order_status_history",
         staging_table="order_status_history",
         columns=(
-            "batch_id", "source_id", "order_source_id", "new_status", "action",
+            "batch_id", "source_id", "order_source_id", "new_status", "action", "reason",
             "occurred_at", "source_updated_at",
         ),
         required_columns=(
@@ -269,6 +337,7 @@ DATASETS: tuple[DatasetSpec, ...] = (
               history.orders_id::bigint AS order_source_id,
               history.new_status,
               history.action,
+              history.reason,
               history.created_at AT TIME ZONE 'UTC' AS occurred_at,
               GREATEST(
                 history.created_at AT TIME ZONE 'UTC',
@@ -291,8 +360,8 @@ DATASETS: tuple[DatasetSpec, ...] = (
         name="facebook_reserves",
         staging_table="facebook_reserves",
         columns=(
-            "batch_id", "source_id", "order_source_id", "created_at", "reserved_until",
-            "status", "deleted_at", "source_updated_at",
+            "batch_id", "source_id", "order_source_id", "keyword", "sku_source_id", "quantity",
+            "created_at", "reserved_until", "status", "deleted_at", "source_updated_at",
         ),
         required_columns=("source_id", "created_at", "status", "source_updated_at"),
         key_columns=("source_id",),
@@ -300,6 +369,9 @@ DATASETS: tuple[DatasetSpec, ...] = (
             SELECT
               id::bigint AS source_id,
               order_id::bigint AS order_source_id,
+              keyword,
+              skus_id::bigint AS sku_source_id,
+              quantity,
               created_at AT TIME ZONE 'UTC' AS created_at,
               reserved_until AT TIME ZONE 'UTC' AS reserved_until,
               status,
@@ -316,7 +388,8 @@ DATASETS: tuple[DatasetSpec, ...] = (
         staging_table="payment_transactions",
         columns=(
             "batch_id", "source_id", "order_source_id", "amount", "current_status",
-            "payment_at", "verified_at", "deleted_at", "source_updated_at",
+            "payment_at", "verified_at", "deleted_at", "payment_method_source_id",
+            "payment_method_name", "source_updated_at",
         ),
         required_columns=(
             "source_id", "order_source_id", "amount", "current_status", "source_updated_at",
@@ -336,19 +409,25 @@ DATASETS: tuple[DatasetSpec, ...] = (
                 END
               ) AS verified_at,
               payment.deleted_at AT TIME ZONE 'UTC' AS deleted_at,
+              payment_method.id::bigint AS payment_method_source_id,
+              payment_method.name AS payment_method_name,
               GREATEST(
                 payment.updated_at AT TIME ZONE 'UTC',
-                COALESCE(slip_check.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC')
+                COALESCE(slip_check.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC'),
+                COALESCE(payment_method.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC')
               ) AS source_updated_at
             FROM payment_transactions AS payment
             LEFT JOIN slip_checks AS slip_check ON slip_check.id = payment.slip_checks_id
+            LEFT JOIN payment_methods AS payment_method ON payment_method.id = payment.payment_methods_id
             WHERE (GREATEST(
                      payment.updated_at AT TIME ZONE 'UTC',
-                     COALESCE(slip_check.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC')
+                     COALESCE(slip_check.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC'),
+                     COALESCE(payment_method.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC')
                    ), payment.id) > (%(window_start)s, %(cursor_id)s)
               AND GREATEST(
                     payment.updated_at AT TIME ZONE 'UTC',
-                    COALESCE(slip_check.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC')
+                    COALESCE(slip_check.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC'),
+                    COALESCE(payment_method.updated_at AT TIME ZONE 'UTC', payment.updated_at AT TIME ZONE 'UTC')
                   ) <= %(window_end)s
             ORDER BY source_updated_at, payment.id
         """,

@@ -71,10 +71,69 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("orders.updated_at AT TIME ZONE 'UTC'", history.query)
         self.assertIn("source_updated_at", history.columns)
 
+    def test_phase_b_extract_queries_include_requested_fields_and_rename_watermark(self) -> None:
+        specs = {item.name: item for item in DATASETS}
+        history = specs["order_status_history"]
+        reserves = specs["facebook_reserves"]
+        payments = specs["payment_transactions"]
+
+        self.assertIn("reason", history.columns)
+        self.assertIn("history.reason", history.query)
+        for column in ("keyword", "sku_source_id", "quantity"):
+            self.assertIn(column, reserves.columns)
+        self.assertIn("skus_id::bigint AS sku_source_id", reserves.query)
+        self.assertIn("keyword", reserves.query)
+        self.assertIn("quantity", reserves.query)
+        for column in ("payment_method_source_id", "payment_method_name"):
+            self.assertIn(column, payments.columns)
+        self.assertIn("payment_method.id::bigint AS payment_method_source_id", payments.query)
+        self.assertIn("payment_method.name AS payment_method_name", payments.query)
+        self.assertIn("LEFT JOIN payment_methods AS payment_method", payments.query)
+        self.assertGreaterEqual(payments.query.count("payment_method.updated_at AT TIME ZONE 'UTC'"), 3)
+        self.assertEqual(SOURCE_CONTRACTS["payment_methods"], ("id", "name", "updated_at"))
+        self.assertIn("reason", SOURCE_CONTRACTS["order_status_history"])
+        self.assertTrue({"keyword", "skus_id", "quantity"}.issubset(SOURCE_CONTRACTS["facebook_reserves"]))
+        self.assertIn("payment_methods_id", SOURCE_CONTRACTS["payment_transactions"])
+
+    def test_phase_b_extracts_do_not_select_restricted_source_fields(self) -> None:
+        specs = {item.name: item for item in DATASETS}
+        queries = (
+            specs["order_status_history"].query.lower(),
+            specs["facebook_reserves"].query.lower(),
+            specs["payment_transactions"].query.lower(),
+        )
+        for field in (
+            "notes", "metadata", "account_number", "account_name", "bank_name",
+            "comment_text", "facebook_comment_id", "phone", "email", "address_line",
+            "slip_image", "token",
+        ):
+            with self.subTest(field=field):
+                self.assertTrue(all(field not in query for query in queries))
+
     def test_social_marts_are_checked_as_warehouse_contracts(self) -> None:
         self.assertIn("is_data_complete", WAREHOUSE_CONTRACTS[("dw", "fact_social_order")])
         self.assertIn("category_source_id", WAREHOUSE_CONTRACTS[("mart", "v_delivered_product_category_daily")])
         self.assertIn("snapshot_as_of", WAREHOUSE_CONTRACTS[("mart", "v_social_order_status")])
+
+    def test_phase_b_and_phase_a_marts_are_checked_as_warehouse_contracts(self) -> None:
+        phase_a_views = (
+            "v_order_cohort_daily", "v_delivered_net_daily", "v_customer_profile",
+            "v_customer_purchase_line", "v_product_customer_daily", "v_product_pair_daily",
+            "v_product_stock_latest", "v_order_operational_detail", "v_order_cancellation",
+            "v_social_order_action",
+        )
+        for view in phase_a_views:
+            with self.subTest(view=view):
+                self.assertIn(("mart", view), WAREHOUSE_CONTRACTS)
+
+        self.assertEqual(WAREHOUSE_CONTRACTS[("mart", "v_order_cancellation")][-1], "cancel_reason")
+        self.assertIn("payment_method_source_id", WAREHOUSE_CONTRACTS[("dw", "fact_payment_transaction")])
+        self.assertIn("payment_method_name", WAREHOUSE_CONTRACTS[("dw", "fact_payment_transaction")])
+        self.assertIn("reason", WAREHOUSE_CONTRACTS[("dw", "fact_order_status_event")])
+        for column in ("keyword", "sku_key", "quantity"):
+            self.assertIn(column, WAREHOUSE_CONTRACTS[("dw", "fact_facebook_reserve")])
+        self.assertIn(("mart", "v_order_payment_method"), WAREHOUSE_CONTRACTS)
+        self.assertIn(("mart", "v_social_order_reserve"), WAREHOUSE_CONTRACTS)
 
     def test_customer_dimension_is_part_of_warehouse_contract(self) -> None:
         self.assertIn("customer_source_id", WAREHOUSE_CONTRACTS[("dw", "dim_customer")])
