@@ -28,6 +28,12 @@ SOURCE_CONTRACTS: dict[str, tuple[str, ...]] = {
     ),
     "products": ("id", "name", "is_active", "deleted_at", "updated_at", "categories_category_id"),
     "categories": ("category_id", "name", "is_active", "deleted_at", "updated_at"),
+    "promotions": (
+        "id", "name", "code", "discount_type", "discount_value", "min_purchase", "max_discount",
+        "usage_limit", "usage_count", "start_date", "end_date", "is_active", "created_at",
+        "updated_at", "deleted_at",
+    ),
+    "categories_has_promotions": ("category_id", "promotions_id", "useCount"),
     "orders": (
         "id", "order_number", "order_date", "status", "sales_channels_sales_id", "customer_id",
         "shipping_details_id", "subtotal", "discount_amount", "shipping_fee", "tax_amount",
@@ -53,6 +59,7 @@ SOURCE_CONTRACTS: dict[str, tuple[str, ...]] = {
     "return_items": ("id", "return_requests_id", "received_quantity", "updated_at"),
     "order_details": (
         "id", "orders_id", "skus_id", "quantity", "unit_price", "discount", "subtotal",
+        "categories_has_promotions_promotions_id", "categories_has_promotions_category_id",
         "deleted_at", "updated_at",
     ),
     "inventory_movements": (
@@ -69,7 +76,29 @@ SOURCE_CONTRACTS: dict[str, tuple[str, ...]] = {
 WAREHOUSE_CONTRACTS: dict[tuple[str, str], tuple[str, ...]] = {
     ("etl", "load_batch"): ("batch_id", "source_system", "status", "completed_at"),
     ("etl", "watermark"): ("source_system", "entity_name", "last_changed_at", "last_source_id", "last_successful_batch_id"),
+    ("etl", "snapshot_state"): (
+        "source_system", "entity_name", "snapshot_at", "snapshot_created_at", "last_successful_batch_id",
+    ),
     ("etl", "rejected_row"): ("batch_id", "entity_name", "source_id", "reason"),
+    ("dw", "dim_promotion"): (
+        "promotion_key", "source_system", "promotion_source_id", "promotion_name", "code",
+        "discount_type", "discount_value", "min_purchase_amount", "max_discount_amount",
+        "usage_limit", "usage_count", "start_at", "end_at", "created_at", "is_active",
+        "is_deleted", "source_updated_at", "last_loaded_batch_id",
+    ),
+    ("dw", "fact_order_line"): (
+        "source_system", "order_line_source_id", "promotion_source_id",
+        "promotion_category_source_id", "promotion_key",
+    ),
+    ("dw", "fact_promotion_daily_snapshot"): (
+        "snapshot_date_key", "promotion_key", "captured_at", "discount_type", "discount_value",
+        "min_purchase_amount", "max_discount_amount", "usage_limit", "usage_count", "start_at",
+        "end_at", "is_active", "is_deleted", "last_loaded_batch_id",
+    ),
+    ("dw", "bridge_promotion_category"): (
+        "source_system", "promotion_source_id", "category_source_id", "use_count", "promotion_key",
+        "is_current", "last_seen_at", "last_seen_batch_id", "last_loaded_batch_id",
+    ),
     ("dw", "dim_customer"): (
         "customer_key", "source_system", "customer_source_id", "customer_name",
         "latest_province_name", "latest_postal_code", "source_updated_at", "last_loaded_batch_id",
@@ -173,6 +202,17 @@ WAREHOUSE_CONTRACTS: dict[tuple[str, str], tuple[str, ...]] = {
         "source_system", "reserve_source_id", "order_source_id", "keyword", "quantity", "reserve_status",
         "created_at", "reserved_until", "sku_key", "sku_code", "product_source_id", "product_name",
     ),
+    ("mart", "v_promotion"): (
+        "promotion_key", "source_system", "promotion_source_id", "promotion_name", "discount_type",
+        "discount_value", "min_purchase_amount", "max_discount_amount", "usage_limit", "usage_count",
+        "start_at", "end_at", "is_active", "is_deleted", "source_updated_at",
+        "first_snapshot_date", "last_snapshot_date",
+    ),
+    ("mart", "v_sales_promotion_daily"): (
+        "date_key", "business_date", "channel_key", "channel_code", "channel_name",
+        "promotion_source_id", "promotion_name", "booked_order_count", "units_sold",
+        "line_discount_amount", "line_subtotal_amount",
+    ),
 }
 
 
@@ -245,6 +285,58 @@ DATASETS: tuple[DatasetSpec, ...] = (
             JOIN products AS p ON p.id = s.products_id
             JOIN categories AS c ON c.category_id = p.categories_category_id
             ORDER BY s.id
+        """,
+    ),
+    DatasetSpec(
+        name="promotions",
+        staging_table="promotions",
+        columns=(
+            "batch_id", "promotion_source_id", "promotion_name", "code", "discount_type",
+            "discount_value", "min_purchase_amount", "max_discount_amount", "usage_limit",
+            "usage_count", "start_at", "end_at", "is_active", "created_at", "deleted_at",
+            "source_updated_at", "as_of_at",
+        ),
+        full_snapshot=True,
+        required_columns=(
+            "promotion_source_id", "promotion_name", "discount_type", "discount_value",
+            "usage_count", "source_updated_at",
+        ),
+        key_columns=("promotion_source_id",),
+        query="""
+            SELECT
+              id::bigint AS promotion_source_id,
+              name AS promotion_name,
+              code,
+              discount_type,
+              discount_value,
+              min_purchase AS min_purchase_amount,
+              max_discount AS max_discount_amount,
+              usage_limit,
+              usage_count,
+              start_date AT TIME ZONE 'UTC' AS start_at,
+              end_date AT TIME ZONE 'UTC' AS end_at,
+              is_active,
+              created_at AT TIME ZONE 'UTC' AS created_at,
+              deleted_at AT TIME ZONE 'UTC' AS deleted_at,
+              updated_at AT TIME ZONE 'UTC' AS source_updated_at
+            FROM promotions
+            ORDER BY id
+        """,
+    ),
+    DatasetSpec(
+        name="promotion_categories",
+        staging_table="promotion_categories",
+        columns=("batch_id", "promotion_source_id", "category_source_id", "use_count"),
+        full_snapshot=True,
+        required_columns=("promotion_source_id", "category_source_id"),
+        key_columns=("promotion_source_id", "category_source_id"),
+        query="""
+            SELECT
+              promotions_id::bigint AS promotion_source_id,
+              category_id::bigint AS category_source_id,
+              "useCount" AS use_count
+            FROM categories_has_promotions
+            ORDER BY promotions_id, category_id
         """,
     ),
     DatasetSpec(
@@ -438,7 +530,7 @@ DATASETS: tuple[DatasetSpec, ...] = (
         columns=(
             "batch_id", "source_id", "order_source_id", "sku_source_id", "quantity",
             "unit_price", "line_discount_amount", "line_subtotal_amount", "deleted_at",
-            "source_updated_at",
+            "source_updated_at", "promotion_source_id", "promotion_category_source_id",
         ),
         required_columns=(
             "source_id", "order_source_id", "sku_source_id", "quantity", "unit_price",
@@ -450,6 +542,8 @@ DATASETS: tuple[DatasetSpec, ...] = (
               id::bigint AS source_id,
               orders_id::bigint AS order_source_id,
               skus_id::bigint AS sku_source_id,
+              categories_has_promotions_promotions_id::bigint AS promotion_source_id,
+              categories_has_promotions_category_id::bigint AS promotion_category_source_id,
               quantity,
               unit_price,
               discount AS line_discount_amount,
@@ -662,7 +756,9 @@ def _check_contracts(source: psycopg.Connection, target: psycopg.Connection) -> 
         types = {(table, column): kind for table, column, kind in cursor.fetchall()}
     for table, columns in SOURCE_CONTRACTS.items():
         for column in columns:
-            if column.endswith('_at') or column in {'order_date', 'payment_date', 'reserved_until'}:
+            if column.endswith('_at') or column in {
+                'order_date', 'payment_date', 'reserved_until', 'start_date', 'end_date',
+            }:
                 if types.get((table, column)) != 'timestamp without time zone':
                     raise RuntimeError(f"OLTP UTC timestamp contract changed: {table}.{column}")
 

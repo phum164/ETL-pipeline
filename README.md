@@ -376,6 +376,8 @@ Dashboard consumers should query only:
 - `mart.v_social_order_action`
 - `mart.v_order_payment_method`
 - `mart.v_social_order_reserve`
+- `mart.v_promotion`
+- `mart.v_sales_promotion_daily`
 
 The ten Phase A views back the business-overview dashboard and its drill-downs.
 Their headers in `warehouse/003_marts.sql` define each grain. Key points:
@@ -475,3 +477,59 @@ The `check` command validates every source table/column used by the extract
 queries and every staging/audit column required by the warehouse contract.
 Each ETL run takes a warehouse session advisory lock before source extraction;
 the lock is released when the run completes or the connection closes.
+
+### Phase C: promotion terms and order-line attribution
+
+Phase C stores the current promotion terms in `dw.dim_promotion`, keeps a daily
+snapshot of terms and `usage_count`, records promotion/category pairs with their
+nullable `useCount`, and carries both optional OLTP promotion/category IDs from
+order lines. `mart.v_promotion` exposes current terms and the first/last dates
+with a captured snapshot. `mart.v_sales_promotion_daily` aggregates booked,
+non-deleted promotion lines by order business date and channel. An unresolved
+promotion ID remains in that sales view with a NULL promotion name. A later
+full extract resolves both old line keys and membership keys when the matching
+promotion enters `dim_promotion`.
+
+Promotion codes are redeemable coupon values and are restricted to `stg`/`dw`;
+no promotion mart exposes `code`. `promotions.description` is not extracted.
+These two promotion marts do not expose buyer or customer names. `message_queue`,
+campaign tables, contact details, account/payment credentials, and free-text
+messages are outside this extract. There is no order-to-`promotion_campaigns`
+link, so the warehouse does not attribute sales to
+`promotion_campaigns`/`promotion_campaign_images` or allocate the order-level
+`discount_amount` to a promotion.
+
+For promotion/category pairs, `is_current` means present in the latest
+successfully applied full snapshot. The ETL compares source-window end time,
+then batch creation time for ties; an empty snapshot still advances this
+marker, and an older replay cannot restore an obsolete pair. Disappeared pairs
+remain stored with `is_current = false`. Promotion keys are resolved again for
+stored lines and pairs when their source promotion ID was retained but the key
+was previously NULL.
+
+The first deployment after adding order-line promotion IDs must run ETL in
+`full` mode because these columns do not advance `order_details.updated_at`.
+Automatic deployments already choose full mode for `etl/` and `warehouse/`
+changes; a manual deploy must also use `full`. Replay fills only order lines
+still present in OLTP. Promotion snapshots begin on the first day this version
+runs; earlier terms and counters cannot be reconstructed and are not backfilled.
+
+The backend order-create paths assign the order-line promotion and category IDs
+from separate optional request values (`item.promotionId || null` and
+`item.categoryId || null`); application code does not validate the pair, while
+the OLTP composite foreign key is enforced when both values are supplied.
+The warehouse stores each value independently; promotion-key resolution uses
+the promotion ID matching `promotions.id`, regardless of whether a category ID
+is present. `OrderService` and the legacy order-detail create path set line
+`discount` to zero. POS import and TikTok sync line creation also set
+`discount` to zero and omit both promotion/category IDs. Service-addon line
+creation omits both IDs and relies on Prisma's default-zero `discount`.
+`PromotionRuleEngine.applyToOrder` contains a separate pair-campaign rule that
+can change line discount and subtotal but does not write these promotion IDs;
+repository search found only its definition/export, not a service/controller
+caller. Gift lines use zero price/discount and keep a campaign ID in a note,
+with no promotion FK. Promotion campaign endpoints/screens are outside this
+phase. No writer for `promotions.usage_count` or
+`categories_has_promotions."useCount"` was found. `usage_count` has an OLTP
+default of zero, while `useCount` is nullable without a default, so the ETL
+stores their source values and does not infer missing usage.

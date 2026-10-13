@@ -7,6 +7,7 @@ DECLARE
   v_batch etl.load_batch%ROWTYPE;
   v_rejected_count BIGINT := 0;
   v_error TEXT;
+  v_apply_promotion_category_snapshot BOOLEAN := FALSE;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('warehouse_db:apply_sales_stock_batch'));
 
@@ -30,6 +31,18 @@ BEGIN
   WHERE load_batch.batch_id = p_batch_id;
 
   BEGIN
+    v_apply_promotion_category_snapshot := NOT EXISTS (
+      SELECT 1
+      FROM etl.snapshot_state AS state
+      WHERE state.source_system = v_batch.source_system
+        AND state.entity_name = 'promotion_categories'
+        AND (
+          state.snapshot_at > v_batch.source_window_ended_at
+          OR (state.snapshot_at = v_batch.source_window_ended_at
+              AND state.snapshot_created_at >= v_batch.created_at)
+        )
+    );
+
     IF EXISTS (
       SELECT 1 FROM stg.sales_channels
       WHERE stg.sales_channels.batch_id = p_batch_id
@@ -46,6 +59,7 @@ BEGIN
         UNION ALL SELECT movement_at FROM stg.inventory_movements WHERE stg.inventory_movements.batch_id = p_batch_id
         UNION ALL SELECT as_of_at FROM stg.skus WHERE stg.skus.batch_id = p_batch_id
         UNION ALL SELECT as_of_at FROM stg.sku_on_channel WHERE stg.sku_on_channel.batch_id = p_batch_id
+        UNION ALL SELECT as_of_at FROM stg.promotions WHERE stg.promotions.batch_id = p_batch_id
       ) AS source_dates
     ));
 
@@ -96,6 +110,129 @@ BEGIN
       source_updated_at = EXCLUDED.source_updated_at,
       last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
     WHERE EXCLUDED.source_updated_at >= dw.dim_sku.source_updated_at;
+
+    INSERT INTO dw.dim_promotion (
+      source_system, promotion_source_id, promotion_name, code, discount_type,
+      discount_value, min_purchase_amount, max_discount_amount, usage_limit, usage_count,
+      start_at, end_at, created_at, is_active, is_deleted, source_updated_at,
+      last_loaded_batch_id
+    )
+    SELECT
+      v_batch.source_system, promotion_source_id, promotion_name, code, discount_type,
+      discount_value, min_purchase_amount, max_discount_amount, usage_limit, usage_count,
+      start_at, end_at, created_at, is_active, deleted_at IS NOT NULL, source_updated_at,
+      p_batch_id
+    FROM stg.promotions
+    WHERE stg.promotions.batch_id = p_batch_id
+    ON CONFLICT (source_system, promotion_source_id) DO UPDATE SET
+      promotion_name = EXCLUDED.promotion_name,
+      code = EXCLUDED.code,
+      discount_type = EXCLUDED.discount_type,
+      discount_value = EXCLUDED.discount_value,
+      min_purchase_amount = EXCLUDED.min_purchase_amount,
+      max_discount_amount = EXCLUDED.max_discount_amount,
+      usage_limit = EXCLUDED.usage_limit,
+      usage_count = EXCLUDED.usage_count,
+      start_at = EXCLUDED.start_at,
+      end_at = EXCLUDED.end_at,
+      created_at = EXCLUDED.created_at,
+      is_active = EXCLUDED.is_active,
+      is_deleted = EXCLUDED.is_deleted,
+      source_updated_at = EXCLUDED.source_updated_at,
+      last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
+    WHERE EXCLUDED.source_updated_at >= dw.dim_promotion.source_updated_at;
+
+    INSERT INTO dw.fact_promotion_daily_snapshot (
+      snapshot_date_key, promotion_key, captured_at, discount_type, discount_value,
+      min_purchase_amount, max_discount_amount, usage_limit, usage_count, start_at,
+      end_at, is_active, is_deleted, last_loaded_batch_id
+    )
+    SELECT
+      etl.date_key(staged.as_of_at), promotion.promotion_key, staged.as_of_at,
+      staged.discount_type, staged.discount_value, staged.min_purchase_amount,
+      staged.max_discount_amount, staged.usage_limit, staged.usage_count,
+      staged.start_at, staged.end_at, staged.is_active, staged.deleted_at IS NOT NULL,
+      p_batch_id
+    FROM stg.promotions AS staged
+    JOIN dw.dim_promotion AS promotion
+      ON promotion.source_system = v_batch.source_system
+     AND promotion.promotion_source_id = staged.promotion_source_id
+    WHERE staged.batch_id = p_batch_id
+    ON CONFLICT (snapshot_date_key, promotion_key) DO UPDATE SET
+      captured_at = EXCLUDED.captured_at,
+      discount_type = EXCLUDED.discount_type,
+      discount_value = EXCLUDED.discount_value,
+      min_purchase_amount = EXCLUDED.min_purchase_amount,
+      max_discount_amount = EXCLUDED.max_discount_amount,
+      usage_limit = EXCLUDED.usage_limit,
+      usage_count = EXCLUDED.usage_count,
+      start_at = EXCLUDED.start_at,
+      end_at = EXCLUDED.end_at,
+      is_active = EXCLUDED.is_active,
+      is_deleted = EXCLUDED.is_deleted,
+      last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
+    WHERE EXCLUDED.captured_at >= dw.fact_promotion_daily_snapshot.captured_at;
+
+    -- A pair is current when it was present in the latest completed full snapshot.
+    UPDATE dw.bridge_promotion_category AS membership
+    SET promotion_key = promotion.promotion_key,
+        last_loaded_batch_id = p_batch_id
+    FROM dw.dim_promotion AS promotion
+    WHERE membership.source_system = v_batch.source_system
+      AND membership.promotion_key IS NULL
+      AND promotion.source_system = membership.source_system
+      AND promotion.promotion_source_id = membership.promotion_source_id;
+
+    IF v_apply_promotion_category_snapshot THEN
+      INSERT INTO dw.bridge_promotion_category AS current_pair (
+        source_system, promotion_source_id, category_source_id, use_count, promotion_key,
+        is_current, last_seen_at, last_seen_batch_id, last_loaded_batch_id
+      )
+      SELECT
+        v_batch.source_system, staged.promotion_source_id, staged.category_source_id,
+        staged.use_count, promotion.promotion_key, TRUE, v_batch.source_window_ended_at,
+        p_batch_id, p_batch_id
+      FROM stg.promotion_categories AS staged
+      LEFT JOIN dw.dim_promotion AS promotion
+        ON promotion.source_system = v_batch.source_system
+       AND promotion.promotion_source_id = staged.promotion_source_id
+      WHERE staged.batch_id = p_batch_id
+      ON CONFLICT (source_system, promotion_source_id, category_source_id) DO UPDATE SET
+        use_count = EXCLUDED.use_count,
+        promotion_key = COALESCE(current_pair.promotion_key, EXCLUDED.promotion_key),
+        is_current = TRUE,
+        last_seen_at = EXCLUDED.last_seen_at,
+        last_seen_batch_id = EXCLUDED.last_seen_batch_id,
+        last_loaded_batch_id = EXCLUDED.last_loaded_batch_id;
+
+      UPDATE dw.bridge_promotion_category AS membership
+      SET is_current = FALSE,
+          last_loaded_batch_id = p_batch_id
+      WHERE membership.source_system = v_batch.source_system
+        AND membership.is_current
+        AND NOT EXISTS (
+          SELECT 1
+          FROM stg.promotion_categories AS staged
+          WHERE staged.batch_id = p_batch_id
+            AND staged.promotion_source_id = membership.promotion_source_id
+            AND staged.category_source_id = membership.category_source_id
+        );
+
+      INSERT INTO etl.snapshot_state (
+        source_system, entity_name, snapshot_at, snapshot_created_at, last_successful_batch_id
+      )
+      VALUES (
+        v_batch.source_system, 'promotion_categories', v_batch.source_window_ended_at,
+        v_batch.created_at, p_batch_id
+      )
+      ON CONFLICT (source_system, entity_name) DO UPDATE SET
+        snapshot_at = EXCLUDED.snapshot_at,
+        snapshot_created_at = EXCLUDED.snapshot_created_at,
+        last_successful_batch_id = EXCLUDED.last_successful_batch_id
+      WHERE EXCLUDED.snapshot_at > etl.snapshot_state.snapshot_at
+         OR (EXCLUDED.snapshot_at = etl.snapshot_state.snapshot_at
+             AND EXCLUDED.snapshot_created_at > etl.snapshot_state.snapshot_created_at);
+    END IF;
 
     INSERT INTO dw.dim_customer (
       source_system, customer_source_id, customer_name, latest_province_name,
@@ -335,17 +472,21 @@ BEGIN
     INSERT INTO dw.fact_order_line (
       source_system, order_line_source_id, order_key, sku_key, quantity, unit_price,
       line_discount_amount, line_subtotal_amount, is_deleted, source_updated_at,
-      last_loaded_batch_id
+      last_loaded_batch_id, promotion_source_id, promotion_category_source_id, promotion_key
     )
     SELECT
       v_batch.source_system, l.source_id, o.order_key, s.sku_key, l.quantity, l.unit_price,
       l.line_discount_amount, l.line_subtotal_amount, l.deleted_at IS NOT NULL,
-      l.source_updated_at, p_batch_id
+      l.source_updated_at, p_batch_id, l.promotion_source_id, l.promotion_category_source_id,
+      promotion.promotion_key
     FROM stg.order_lines AS l
     JOIN dw.fact_order AS o
       ON o.source_system = v_batch.source_system AND o.order_source_id = l.order_source_id
     JOIN dw.dim_sku AS s
       ON s.source_system = v_batch.source_system AND s.sku_source_id = l.sku_source_id
+    LEFT JOIN dw.dim_promotion AS promotion
+      ON promotion.source_system = v_batch.source_system
+     AND promotion.promotion_source_id = l.promotion_source_id
     WHERE l.batch_id = p_batch_id
     ON CONFLICT (source_system, order_line_source_id) DO UPDATE SET
       order_key = EXCLUDED.order_key,
@@ -356,8 +497,21 @@ BEGIN
       line_subtotal_amount = EXCLUDED.line_subtotal_amount,
       is_deleted = EXCLUDED.is_deleted,
       source_updated_at = EXCLUDED.source_updated_at,
-      last_loaded_batch_id = EXCLUDED.last_loaded_batch_id
+      last_loaded_batch_id = EXCLUDED.last_loaded_batch_id,
+      promotion_source_id = EXCLUDED.promotion_source_id,
+      promotion_category_source_id = EXCLUDED.promotion_category_source_id,
+      promotion_key = EXCLUDED.promotion_key
     WHERE EXCLUDED.source_updated_at >= dw.fact_order_line.source_updated_at;
+
+    UPDATE dw.fact_order_line AS line
+    SET promotion_key = promotion.promotion_key,
+        last_loaded_batch_id = p_batch_id
+    FROM dw.dim_promotion AS promotion
+    WHERE line.source_system = v_batch.source_system
+      AND line.promotion_source_id IS NOT NULL
+      AND line.promotion_key IS NULL
+      AND promotion.source_system = line.source_system
+      AND promotion.promotion_source_id = line.promotion_source_id;
 
     INSERT INTO etl.rejected_row (batch_id, entity_name, source_id, reason, payload)
     SELECT
@@ -676,6 +830,8 @@ BEGIN
         'payment_transactions', (SELECT COUNT(*) FROM stg.payment_transactions WHERE stg.payment_transactions.batch_id = p_batch_id),
         'inventory_movements', (SELECT COUNT(*) FROM stg.inventory_movements WHERE stg.inventory_movements.batch_id = p_batch_id),
         'sku_on_channel', (SELECT COUNT(*) FROM stg.sku_on_channel WHERE stg.sku_on_channel.batch_id = p_batch_id),
+        'promotions', (SELECT COUNT(*) FROM stg.promotions WHERE stg.promotions.batch_id = p_batch_id),
+        'promotion_categories', (SELECT COUNT(*) FROM stg.promotion_categories WHERE stg.promotion_categories.batch_id = p_batch_id),
         'rejected_rows', v_rejected_count
       )
   WHERE load_batch.batch_id = p_batch_id;

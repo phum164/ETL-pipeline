@@ -135,6 +135,134 @@ class PipelineTests(unittest.TestCase):
         self.assertIn(("mart", "v_order_payment_method"), WAREHOUSE_CONTRACTS)
         self.assertIn(("mart", "v_social_order_reserve"), WAREHOUSE_CONTRACTS)
 
+    def test_phase_c_promotion_extracts_use_full_snapshot_contracts_and_utc(self) -> None:
+        specs = {item.name: item for item in DATASETS}
+        promotions = specs["promotions"]
+        memberships = specs["promotion_categories"]
+
+        self.assertTrue(promotions.full_snapshot)
+        self.assertEqual(promotions.key_columns, ("promotion_source_id",))
+        self.assertIn("promotion_source_id", promotions.required_columns)
+        self.assertIn("as_of_at", promotions.columns)
+        promotion_selects = (
+            ("id::bigint AS promotion_source_id", "promotion_source_id"),
+            ("name AS promotion_name", "promotion_name"),
+            ("code,", "code"),
+            ("discount_type,", "discount_type"),
+            ("discount_value,", "discount_value"),
+            ("min_purchase AS min_purchase_amount", "min_purchase_amount"),
+            ("max_discount AS max_discount_amount", "max_discount_amount"),
+            ("usage_limit,", "usage_limit"),
+            ("usage_count,", "usage_count"),
+            ("start_date AT TIME ZONE 'UTC' AS start_at", "start_at"),
+            ("end_date AT TIME ZONE 'UTC' AS end_at", "end_at"),
+            ("is_active,", "is_active"),
+            ("created_at AT TIME ZONE 'UTC' AS created_at", "created_at"),
+            ("deleted_at AT TIME ZONE 'UTC' AS deleted_at", "deleted_at"),
+            ("updated_at AT TIME ZONE 'UTC' AS source_updated_at", "source_updated_at"),
+        )
+        for expression, output_column in promotion_selects:
+            with self.subTest(output_column=output_column):
+                self.assertIn(expression, promotions.query)
+                self.assertIn(output_column, promotions.columns)
+        self.assertIn("FROM promotions", promotions.query)
+        self.assertNotIn("description", promotions.query.lower())
+        self.assertEqual(
+            SOURCE_CONTRACTS["promotions"],
+            (
+                "id", "name", "code", "discount_type", "discount_value", "min_purchase",
+                "max_discount", "usage_limit", "usage_count", "start_date", "end_date",
+                "is_active", "created_at", "updated_at", "deleted_at",
+            ),
+        )
+        self.assertTrue(
+            {
+                "promotion_source_id", "promotion_name", "code", "discount_type",
+                "discount_value", "min_purchase_amount", "max_discount_amount",
+                "usage_limit", "usage_count", "start_at", "end_at", "is_active",
+                "created_at", "deleted_at", "source_updated_at", "as_of_at",
+            }.issubset(promotions.columns)
+        )
+
+        self.assertTrue(memberships.full_snapshot)
+        self.assertEqual(
+            memberships.key_columns,
+            ("promotion_source_id", "category_source_id"),
+        )
+        self.assertEqual(
+            memberships.required_columns,
+            ("promotion_source_id", "category_source_id"),
+        )
+        self.assertIn('"useCount" AS use_count', memberships.query)
+        self.assertIn("FROM categories_has_promotions", memberships.query)
+        self.assertTrue(
+            {"promotion_source_id", "category_source_id", "use_count"}.issubset(memberships.columns)
+        )
+        for expression, output_column in (
+            ("promotions_id::bigint AS promotion_source_id", "promotion_source_id"),
+            ("category_id::bigint AS category_source_id", "category_source_id"),
+            ('"useCount" AS use_count', "use_count"),
+        ):
+            with self.subTest(membership_output=output_column):
+                self.assertIn(expression, memberships.query)
+                self.assertIn(output_column, memberships.columns)
+        self.assertEqual(
+            SOURCE_CONTRACTS["categories_has_promotions"],
+            ("category_id", "promotions_id", "useCount"),
+        )
+
+    def test_phase_c_order_line_promotion_ids_and_warehouse_contracts(self) -> None:
+        line_spec = next(item for item in DATASETS if item.name == "order_lines")
+        for field in ("categories_has_promotions_promotions_id", "categories_has_promotions_category_id"):
+            self.assertIn(field, SOURCE_CONTRACTS["order_details"])
+        for field, expression in (
+            ("promotion_source_id", "categories_has_promotions_promotions_id::bigint AS promotion_source_id"),
+            ("promotion_category_source_id", "categories_has_promotions_category_id::bigint AS promotion_category_source_id"),
+        ):
+            self.assertIn(field, line_spec.columns)
+            self.assertIn(expression, line_spec.query)
+        self.assertIn("WHERE (updated_at AT TIME ZONE 'UTC', id)", line_spec.query)
+
+        line_contract = WAREHOUSE_CONTRACTS[("dw", "fact_order_line")]
+        self.assertTrue(
+            {"promotion_source_id", "promotion_category_source_id", "promotion_key"}.issubset(line_contract)
+        )
+        for contract, required in (
+            (
+                ("etl", "snapshot_state"),
+                {"source_system", "entity_name", "snapshot_at", "snapshot_created_at", "last_successful_batch_id"},
+            ),
+            (
+                ("dw", "dim_promotion"),
+                {"promotion_key", "source_system", "promotion_source_id", "code", "source_updated_at"},
+            ),
+            (
+                ("dw", "fact_promotion_daily_snapshot"),
+                {"snapshot_date_key", "promotion_key", "captured_at", "discount_value", "usage_count"},
+            ),
+            (
+                ("dw", "bridge_promotion_category"),
+                {"source_system", "promotion_source_id", "category_source_id", "use_count", "promotion_key", "is_current"},
+            ),
+        ):
+            with self.subTest(contract=contract):
+                self.assertTrue(required.issubset(WAREHOUSE_CONTRACTS[contract]))
+        self.assertTrue(
+            {
+                "promotion_key", "source_system", "promotion_source_id", "promotion_name",
+                "discount_type", "discount_value", "first_snapshot_date", "last_snapshot_date",
+            }.issubset(WAREHOUSE_CONTRACTS[("mart", "v_promotion")])
+        )
+        self.assertTrue(
+            {
+                "promotion_source_id", "promotion_name", "booked_order_count", "units_sold",
+                "line_discount_amount", "line_subtotal_amount",
+            }.issubset(WAREHOUSE_CONTRACTS[("mart", "v_sales_promotion_daily")])
+        )
+        for field in ("code", "buyer_name", "customer_name"):
+            self.assertNotIn(field, WAREHOUSE_CONTRACTS[("mart", "v_promotion")])
+            self.assertNotIn(field, WAREHOUSE_CONTRACTS[("mart", "v_sales_promotion_daily")])
+
     def test_customer_dimension_is_part_of_warehouse_contract(self) -> None:
         self.assertIn("customer_source_id", WAREHOUSE_CONTRACTS[("dw", "dim_customer")])
         self.assertIn("customer_key", WAREHOUSE_CONTRACTS[("dw", "fact_order")])

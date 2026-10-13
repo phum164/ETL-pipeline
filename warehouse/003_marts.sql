@@ -797,3 +797,66 @@ SELECT
 FROM dw.fact_facebook_reserve AS r
 LEFT JOIN dw.dim_sku AS s ON s.sku_key = r.sku_key
 WHERE NOT r.is_deleted;
+
+
+-- Promotion code is restricted to stg/dw. This view exposes current terms and
+-- the first/last dates for which an actual daily snapshot is available.
+CREATE OR REPLACE VIEW mart.v_promotion AS
+WITH snapshot_dates AS (
+  SELECT
+    promotion_key,
+    MIN(snapshot_date_key) AS first_snapshot_date_key,
+    MAX(snapshot_date_key) AS last_snapshot_date_key
+  FROM dw.fact_promotion_daily_snapshot
+  GROUP BY promotion_key
+)
+SELECT
+  promotion.promotion_key,
+  promotion.source_system,
+  promotion.promotion_source_id,
+  promotion.promotion_name,
+  promotion.discount_type,
+  promotion.discount_value,
+  promotion.min_purchase_amount,
+  promotion.max_discount_amount,
+  promotion.usage_limit,
+  promotion.usage_count,
+  promotion.start_at,
+  promotion.end_at,
+  promotion.is_active,
+  promotion.is_deleted,
+  promotion.source_updated_at,
+  first_date.calendar_date AS first_snapshot_date,
+  last_date.calendar_date AS last_snapshot_date
+FROM dw.dim_promotion AS promotion
+LEFT JOIN snapshot_dates AS snapshots ON snapshots.promotion_key = promotion.promotion_key
+LEFT JOIN dw.dim_date AS first_date ON first_date.date_key = snapshots.first_snapshot_date_key
+LEFT JOIN dw.dim_date AS last_date ON last_date.date_key = snapshots.last_snapshot_date_key;
+
+-- Grain: order business date, channel, and source promotion id. Unresolved
+-- promotion ids remain visible with a NULL promotion_name.
+CREATE OR REPLACE VIEW mart.v_sales_promotion_daily AS
+SELECT
+  d.date_key,
+  d.calendar_date AS business_date,
+  channel.channel_key,
+  channel.channel_code,
+  channel.channel_name,
+  line.promotion_source_id,
+  promotion.promotion_name,
+  COUNT(DISTINCT order_fact.order_key)::BIGINT AS booked_order_count,
+  SUM(line.quantity)::BIGINT AS units_sold,
+  COALESCE(SUM(line.line_discount_amount), 0)::NUMERIC(18, 2) AS line_discount_amount,
+  COALESCE(SUM(line.line_subtotal_amount), 0)::NUMERIC(18, 2) AS line_subtotal_amount
+FROM dw.fact_order_line AS line
+JOIN dw.fact_order AS order_fact ON order_fact.order_key = line.order_key
+JOIN dw.dim_date AS d ON d.date_key = order_fact.order_date_key
+JOIN dw.dim_channel AS channel ON channel.channel_key = order_fact.channel_key
+LEFT JOIN dw.dim_promotion AS promotion ON promotion.promotion_key = line.promotion_key
+WHERE line.promotion_source_id IS NOT NULL
+  AND NOT line.is_deleted
+  AND NOT order_fact.is_cancelled
+  AND NOT order_fact.is_deleted
+GROUP BY
+  d.date_key, d.calendar_date, channel.channel_key, channel.channel_code,
+  channel.channel_name, line.promotion_source_id, promotion.promotion_name;

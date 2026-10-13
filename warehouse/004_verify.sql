@@ -949,11 +949,12 @@ BEGIN
         'v_order_cohort_daily', 'v_delivered_net_daily', 'v_customer_purchase_line',
         'v_product_customer_daily', 'v_product_pair_daily', 'v_product_stock_latest',
         'v_order_operational_detail', 'v_order_cancellation', 'v_social_order_action',
-        'v_order_payment_method', 'v_social_order_reserve'
+        'v_order_payment_method', 'v_social_order_reserve', 'v_promotion',
+        'v_sales_promotion_daily'
       )
-      AND column_name IN ('buyer_name', 'customer_name')
+      AND column_name IN ('buyer_name', 'customer_name', 'code')
   ) THEN
-    RAISE EXCEPTION 'Privacy: new marts other than v_customer_profile must not expose buyer/customer names';
+    RAISE EXCEPTION 'Privacy: promotion and non-profile marts must not expose restricted names or promotion codes';
   END IF;
 END;
 $$;
@@ -1218,6 +1219,364 @@ BEGIN
        WHERE reserve_source_id = 8103 AND keyword IS NULL
      ) THEN
     RAISE EXCEPTION 'Replay: reserve corrections duplicated or lost reserve evidence';
+  END IF;
+END;
+$$;
+
+-- ---------------------------------------------------------------------
+-- Phase C promotion history, order-line resolution, and membership state.
+-- Separate IDs/batches keep this fixture independent from phases A and B.
+-- ---------------------------------------------------------------------
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('77777777-7777-7777-7777-777777777777', 'db_oltp', '2026-09-03 00:00+07', '2026-09-03 10:00+07');
+
+INSERT INTO stg.promotions (
+  batch_id, promotion_source_id, promotion_name, code, discount_type, discount_value,
+  min_purchase_amount, max_discount_amount, usage_limit, usage_count, start_at, end_at,
+  is_active, created_at, deleted_at, source_updated_at, as_of_at
+)
+VALUES (
+  '77777777-7777-7777-7777-777777777777', 9201, 'Phase C promotion', 'PRIVATE-9201',
+  'percentage', 10, 100, 50, 100, 2, '2026-09-03 00:00+07', '2026-09-30 23:59+07',
+  TRUE, '2026-08-01 10:00+07', NULL, '2026-09-03 09:00+07', '2026-09-03 10:00+07'
+);
+
+INSERT INTO stg.promotion_categories (
+  batch_id, promotion_source_id, category_source_id, use_count
+)
+VALUES ('77777777-7777-7777-7777-777777777777', 9201, 9301, 4);
+
+INSERT INTO stg.orders (
+  batch_id, source_id, order_number, order_at, current_status, channel_source_id,
+  subtotal_amount, discount_amount, total_amount, source_updated_at
+)
+VALUES
+  ('77777777-7777-7777-7777-777777777777', 3015, 'PROMO-3015', '2026-09-03 09:00+07', 'completed', 1, 290, 0, 290, '2026-09-03 09:01+07'),
+  ('77777777-7777-7777-7777-777777777777', 3016, 'PROMO-3016', '2026-09-03 09:30+07', 'completed', 1, 60, 0, 60, '2026-09-03 09:31+07'),
+  ('77777777-7777-7777-7777-777777777777', 3017, 'PROMO-3017', '2026-09-03 09:45+07', 'cancelled', 1, 30, 0, 30, '2026-09-03 09:46+07');
+
+INSERT INTO stg.order_lines (
+  batch_id, source_id, order_source_id, sku_source_id, quantity, unit_price,
+  line_discount_amount, line_subtotal_amount, deleted_at, source_updated_at,
+  promotion_source_id, promotion_category_source_id
+)
+VALUES
+  ('77777777-7777-7777-7777-777777777777', 4101, 3015, 101, 2, 100, 0, 200, NULL, '2026-09-03 09:01+07', 9201, 9301),
+  ('77777777-7777-7777-7777-777777777777', 4102, 3015, 101, 1, 50, 10, 40, NULL, '2026-09-03 09:01+07', 9202, NULL),
+  ('77777777-7777-7777-7777-777777777777', 4103, 3016, 101, 1, 60, 0, 60, NULL, '2026-09-03 09:31+07', NULL, NULL),
+  ('77777777-7777-7777-7777-777777777777', 4104, 3017, 101, 1, 30, 0, 30, NULL, '2026-09-03 09:46+07', 9201, 9301),
+  ('77777777-7777-7777-7777-777777777777', 4105, 3015, 101, 10, 10, 0, 100, '2026-09-03 09:02+07', '2026-09-03 09:02+07', 9201, 9301),
+  ('77777777-7777-7777-7777-777777777777', 4106, 3015, 101, 1, 50, 0, 50, NULL, '2026-09-03 09:01+07', 9201, 9301);
+
+SELECT * FROM etl.apply_sales_stock_batch('77777777-7777-7777-7777-777777777777');
+
+DO $$
+BEGIN
+  IF (SELECT status FROM etl.load_batch WHERE batch_id = '77777777-7777-7777-7777-777777777777') <> 'SUCCEEDED' THEN
+    RAISE EXCEPTION 'Phase C: initial promotion fixture batch must succeed';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.fact_order_line
+    WHERE order_line_source_id = 4101 AND promotion_source_id = 9201
+      AND promotion_category_source_id = 9301 AND promotion_key IS NOT NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM dw.fact_order_line
+    WHERE order_line_source_id = 4102 AND promotion_source_id = 9202
+      AND promotion_category_source_id IS NULL AND promotion_key IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM dw.fact_order_line
+    WHERE order_line_source_id = 4103 AND promotion_source_id IS NULL
+      AND promotion_category_source_id IS NULL AND promotion_key IS NULL
+  ) THEN
+    RAISE EXCEPTION 'Phase C: resolved, unresolved, and no-promotion lines were not retained correctly';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM mart.v_sales_promotion_daily
+    WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS'
+      AND promotion_source_id = 9202 AND promotion_name IS NULL
+      AND booked_order_count = 1 AND units_sold = 1
+      AND line_discount_amount = 10 AND line_subtotal_amount = 40
+  ) THEN
+    RAISE EXCEPTION 'Phase C: unresolved promotion line must remain visible with a NULL name';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM mart.v_sales_promotion_daily
+    WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS'
+      AND promotion_source_id = 9201 AND booked_order_count = 1
+      AND units_sold = 3 AND line_discount_amount = 0 AND line_subtotal_amount = 250
+  ) OR EXISTS (
+    SELECT 1 FROM mart.v_sales_promotion_daily
+    WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS'
+      AND promotion_source_id = 9201
+      AND (booked_order_count <> 1 OR units_sold <> 3
+        OR line_discount_amount <> 0 OR line_subtotal_amount <> 250)
+  ) OR EXISTS (
+    SELECT 1 FROM mart.v_sales_promotion_daily
+    WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS'
+      AND promotion_source_id IS NULL
+  ) THEN
+    RAISE EXCEPTION 'Phase C: cancelled/deleted lines leaked or the no-promotion line was exposed';
+  END IF;
+END;
+$$;
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('88888888-8888-8888-8888-888888888888', 'db_oltp', '2026-09-03 10:00+07', '2026-09-04 15:00+07');
+
+INSERT INTO stg.promotions (
+  batch_id, promotion_source_id, promotion_name, code, discount_type, discount_value,
+  min_purchase_amount, max_discount_amount, usage_limit, usage_count, start_at, end_at,
+  is_active, created_at, deleted_at, source_updated_at, as_of_at
+)
+VALUES
+  ('88888888-8888-8888-8888-888888888888', 9201, 'Phase C promotion updated', 'PRIVATE-9201',
+   'percentage', 15, 120, 60, 100, 9, '2026-09-04 00:00+07', '2026-10-01 23:59+07',
+   FALSE, '2026-08-01 10:00+07', NULL, '2026-09-04 14:00+07', '2026-09-04 15:00+07'),
+  ('88888888-8888-8888-8888-888888888888', 9202, 'Late promotion', 'PRIVATE-9202',
+   'fixed', 5, NULL, 25, NULL, 1, '2026-09-04 00:00+07', '2026-10-01 23:59+07',
+   TRUE, '2026-09-04 12:00+07', NULL, '2026-09-04 14:30+07', '2026-09-04 15:00+07');
+
+INSERT INTO stg.promotion_categories (
+  batch_id, promotion_source_id, category_source_id, use_count
+)
+VALUES ('88888888-8888-8888-8888-888888888888', 9202, 9302, 1);
+
+SELECT * FROM etl.apply_sales_stock_batch('88888888-8888-8888-8888-888888888888');
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.fact_order_line AS line
+    JOIN dw.dim_promotion AS promotion ON promotion.promotion_key = line.promotion_key
+    WHERE line.order_line_source_id = 4102 AND promotion.promotion_source_id = 9202
+  ) OR NOT EXISTS (
+    SELECT 1 FROM mart.v_sales_promotion_daily
+    WHERE business_date = DATE '2026-09-03' AND promotion_source_id = 9202
+      AND promotion_name = 'Late promotion'
+  ) THEN
+    RAISE EXCEPTION 'Phase C: a later promotion extract must resolve the stored line key';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.bridge_promotion_category
+    WHERE promotion_source_id = 9201 AND category_source_id = 9301
+      AND use_count = 4 AND NOT is_current
+  ) OR NOT EXISTS (
+    SELECT 1 FROM dw.bridge_promotion_category
+    WHERE promotion_source_id = 9202 AND category_source_id = 9302
+      AND use_count = 1 AND is_current
+  ) THEN
+    RAISE EXCEPTION 'Phase C: disappeared category pairs must be retained as not current';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.fact_promotion_daily_snapshot AS snapshot
+    JOIN dw.dim_promotion AS promotion ON promotion.promotion_key = snapshot.promotion_key
+    WHERE promotion.promotion_source_id = 9201 AND snapshot.snapshot_date_key = 20260903
+      AND snapshot.usage_count = 2 AND snapshot.discount_value = 10
+  ) OR NOT EXISTS (
+    SELECT 1 FROM dw.fact_promotion_daily_snapshot AS snapshot
+    JOIN dw.dim_promotion AS promotion ON promotion.promotion_key = snapshot.promotion_key
+    WHERE promotion.promotion_source_id = 9201 AND snapshot.snapshot_date_key = 20260904
+      AND snapshot.usage_count = 9 AND snapshot.discount_value = 15
+  ) THEN
+    RAISE EXCEPTION 'Phase C: changed promotion terms/counters must retain both daily snapshots';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM mart.v_promotion
+    WHERE promotion_source_id = 9201 AND usage_count = 9 AND discount_value = 15
+      AND NOT is_active AND first_snapshot_date = DATE '2026-09-03'
+      AND last_snapshot_date = DATE '2026-09-04'
+  ) THEN
+    RAISE EXCEPTION 'Phase C: promotion mart must expose latest terms and available snapshot dates';
+  END IF;
+END;
+$$;
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('99999999-9999-9999-9999-999999999999', 'db_oltp', '2026-09-04 00:00+07', '2026-09-04 10:00+07');
+
+INSERT INTO stg.promotions (
+  batch_id, promotion_source_id, promotion_name, code, discount_type, discount_value,
+  min_purchase_amount, max_discount_amount, usage_limit, usage_count, start_at, end_at,
+  is_active, created_at, deleted_at, source_updated_at, as_of_at
+)
+VALUES (
+  '99999999-9999-9999-9999-999999999999', 9201, 'Older replay terms', 'PRIVATE-9201',
+  'percentage', 3, 10, 20, 100, 99, '2026-09-01 00:00+07', '2026-09-15 23:59+07',
+  TRUE, '2026-08-01 10:00+07', NULL, '2026-09-03 09:00+07', '2026-09-04 10:00+07'
+);
+
+INSERT INTO stg.promotion_categories (
+  batch_id, promotion_source_id, category_source_id, use_count
+)
+VALUES ('99999999-9999-9999-9999-999999999999', 9201, 9301, 99);
+
+SELECT * FROM etl.apply_sales_stock_batch('99999999-9999-9999-9999-999999999999');
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.fact_promotion_daily_snapshot AS snapshot
+    JOIN dw.dim_promotion AS promotion ON promotion.promotion_key = snapshot.promotion_key
+    WHERE promotion.promotion_source_id = 9201 AND snapshot.snapshot_date_key = 20260904
+      AND snapshot.captured_at = '2026-09-04 15:00+07'::TIMESTAMPTZ
+      AND snapshot.usage_count = 9 AND snapshot.discount_value = 15
+  ) OR NOT EXISTS (
+    SELECT 1 FROM dw.dim_promotion
+    WHERE promotion_source_id = 9201 AND usage_count = 9 AND discount_value = 15
+      AND NOT is_active
+  ) OR NOT EXISTS (
+    SELECT 1 FROM dw.bridge_promotion_category
+    WHERE promotion_source_id = 9201 AND category_source_id = 9301
+      AND use_count = 4 AND NOT is_current
+  ) OR NOT EXISTS (
+    SELECT 1 FROM dw.bridge_promotion_category
+    WHERE promotion_source_id = 9202 AND category_source_id = 9302
+      AND use_count = 1 AND is_current
+  ) THEN
+    RAISE EXCEPTION 'Phase C: older snapshot replay overwrote newer terms, counters, or current category pairs';
+  END IF;
+END;
+$$;
+
+-- Reapply the latest snapshot under a new batch id to verify key-based idempotency.
+INSERT INTO etl.load_batch (
+  batch_id, source_system, source_window_started_at, source_window_ended_at, created_at
+)
+SELECT
+  'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', source_system, source_window_started_at,
+  source_window_ended_at, created_at + INTERVAL '1 minute'
+FROM etl.load_batch
+WHERE batch_id = '88888888-8888-8888-8888-888888888888';
+
+INSERT INTO stg.promotions (
+  batch_id, promotion_source_id, promotion_name, code, discount_type, discount_value,
+  min_purchase_amount, max_discount_amount, usage_limit, usage_count, start_at, end_at,
+  is_active, created_at, deleted_at, source_updated_at, as_of_at
+)
+SELECT
+  'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', promotion_source_id, promotion_name, code,
+  discount_type, discount_value, min_purchase_amount, max_discount_amount, usage_limit,
+  usage_count, start_at, end_at, is_active, created_at, deleted_at, source_updated_at, as_of_at
+FROM stg.promotions
+WHERE batch_id = '88888888-8888-8888-8888-888888888888';
+
+INSERT INTO stg.promotion_categories (
+  batch_id, promotion_source_id, category_source_id, use_count
+)
+SELECT
+  'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', promotion_source_id, category_source_id, use_count
+FROM stg.promotion_categories
+WHERE batch_id = '88888888-8888-8888-8888-888888888888';
+
+INSERT INTO stg.order_lines (
+  batch_id, source_id, order_source_id, sku_source_id, quantity, unit_price,
+  line_discount_amount, line_subtotal_amount, deleted_at, source_updated_at,
+  promotion_source_id, promotion_category_source_id
+)
+SELECT
+  'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', source_id, order_source_id, sku_source_id,
+  quantity, unit_price, line_discount_amount, line_subtotal_amount, deleted_at,
+  source_updated_at, promotion_source_id, promotion_category_source_id
+FROM stg.order_lines
+WHERE batch_id = '77777777-7777-7777-7777-777777777777';
+
+SELECT * FROM etl.apply_sales_stock_batch('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+SELECT * FROM etl.apply_sales_stock_batch('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+
+DO $$
+BEGIN
+  IF (SELECT COUNT(*) FROM dw.fact_order_line WHERE order_line_source_id BETWEEN 4101 AND 4106) <> 6
+     OR (SELECT COUNT(*) FROM dw.bridge_promotion_category WHERE promotion_source_id IN (9201, 9202)) <> 2
+     OR (SELECT COUNT(*) FROM dw.fact_promotion_daily_snapshot AS snapshot
+         JOIN dw.dim_promotion AS promotion ON promotion.promotion_key = snapshot.promotion_key
+         WHERE promotion.promotion_source_id IN (9201, 9202)) <> 3 THEN
+    RAISE EXCEPTION 'Phase C: replay duplicated order lines, category pairs, or promotion snapshots';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.fact_promotion_daily_snapshot AS snapshot
+    JOIN dw.dim_promotion AS promotion ON promotion.promotion_key = snapshot.promotion_key
+    WHERE promotion.promotion_source_id = 9201 AND snapshot.snapshot_date_key = 20260904
+      AND snapshot.captured_at = '2026-09-04 15:00+07'::TIMESTAMPTZ
+      AND snapshot.usage_count = 9 AND snapshot.discount_value = 15
+  ) OR NOT EXISTS (
+    SELECT 1 FROM dw.dim_promotion
+    WHERE promotion_source_id = 9201 AND usage_count = 9 AND discount_value = 15
+      AND NOT is_active
+  ) THEN
+    RAISE EXCEPTION 'Phase C: older same-day snapshot replay overwrote newer promotion state';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.bridge_promotion_category
+    WHERE promotion_source_id = 9201 AND category_source_id = 9301
+      AND use_count = 4 AND NOT is_current
+  ) OR NOT EXISTS (
+    SELECT 1 FROM dw.bridge_promotion_category
+    WHERE promotion_source_id = 9202 AND category_source_id = 9302
+      AND use_count = 1 AND is_current
+  ) THEN
+    RAISE EXCEPTION 'Phase C: older snapshot replay resurrected or replaced category-pair state';
+  END IF;
+  IF (
+    SELECT COALESCE(SUM(units_sold), 0) FROM mart.v_sales_promotion_daily
+    WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS'
+  ) + (
+    SELECT COALESCE(SUM(line.quantity), 0)
+    FROM dw.fact_order_line AS line
+    JOIN dw.fact_order AS order_fact ON order_fact.order_key = line.order_key
+    WHERE order_fact.order_source_id BETWEEN 3015 AND 3017
+      AND line.promotion_source_id IS NULL
+      AND NOT line.is_deleted AND NOT order_fact.is_cancelled AND NOT order_fact.is_deleted
+  ) <> (
+    SELECT COALESCE(SUM(units_sold), 0) FROM mart.v_sales_sku_daily
+    WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS'
+  ) OR (
+    SELECT COALESCE(SUM(line_subtotal_amount), 0) FROM mart.v_sales_promotion_daily
+    WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS'
+  ) + (
+    SELECT COALESCE(SUM(line.line_subtotal_amount), 0)
+    FROM dw.fact_order_line AS line
+    JOIN dw.fact_order AS order_fact ON order_fact.order_key = line.order_key
+    WHERE order_fact.order_source_id BETWEEN 3015 AND 3017
+      AND line.promotion_source_id IS NULL
+      AND NOT line.is_deleted AND NOT order_fact.is_cancelled AND NOT order_fact.is_deleted
+  ) <> (
+    SELECT COALESCE(SUM(line_subtotal_amount), 0) FROM mart.v_sales_sku_daily
+    WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS'
+  ) THEN
+    RAISE EXCEPTION 'Phase C: promotion and non-promotion lines do not reconcile to existing line sales totals';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'mart'
+      AND table_name IN ('v_promotion', 'v_sales_promotion_daily')
+      AND column_name IN ('code', 'buyer_name', 'customer_name')
+  ) THEN
+    RAISE EXCEPTION 'Phase C: promotion marts expose restricted code or customer names';
+  END IF;
+END;
+$$;
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'db_oltp', '2026-09-04 15:00+07', '2026-09-05 12:00+07');
+
+-- An empty full snapshot still advances membership state and clears all current pairs.
+SELECT * FROM etl.apply_sales_stock_batch('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM dw.bridge_promotion_category
+    WHERE promotion_source_id IN (9201, 9202) AND is_current
+  ) OR NOT EXISTS (
+    SELECT 1 FROM dw.bridge_promotion_category
+    WHERE promotion_source_id = 9202 AND category_source_id = 9302 AND NOT is_current
+  ) OR NOT EXISTS (
+    SELECT 1 FROM etl.snapshot_state
+    WHERE source_system = 'db_oltp' AND entity_name = 'promotion_categories'
+      AND snapshot_at = '2026-09-05 12:00+07'::TIMESTAMPTZ
+      AND last_successful_batch_id = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+  ) THEN
+    RAISE EXCEPTION 'Phase C: an empty full snapshot must retain pairs as not current and advance its marker';
   END IF;
 END;
 $$;
