@@ -1,4 +1,14 @@
 -- Dashboard contracts. Read only from mart.*; do not join fact headers to lines for revenue totals.
+CREATE OR REPLACE VIEW mart.v_channel_catalog AS
+SELECT DISTINCT ON (channel_code)
+  channel_code,
+  channel_name
+FROM dw.dim_channel
+WHERE is_active
+  AND NOT is_deleted
+  AND NULLIF(BTRIM(channel_code), '') IS NOT NULL
+ORDER BY channel_code, source_updated_at DESC, channel_key DESC;
+
 CREATE OR REPLACE VIEW mart.v_sales_daily AS
 WITH metrics AS (
   SELECT
