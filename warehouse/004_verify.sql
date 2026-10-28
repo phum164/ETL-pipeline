@@ -1581,4 +1581,381 @@ BEGIN
 END;
 $$;
 
+-- Hard-deleted source lines: a line missing from the full id snapshot is
+-- marked deleted, an older replay cannot resurrect it, and a batch without a
+-- snapshot changes nothing.
+CREATE TEMP TABLE line_delete_before AS
+SELECT
+  (SELECT COUNT(*) FROM dw.fact_order_line WHERE source_system = 'db_oltp' AND is_deleted) AS deleted_lines,
+  (SELECT COALESCE(SUM(units_sold), 0) FROM mart.v_sales_sku_daily
+   WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS') AS units_sold,
+  (SELECT COALESCE(SUM(line_subtotal_amount), 0) FROM mart.v_sales_sku_daily
+   WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS') AS line_sales;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.fact_order_line
+    WHERE source_system = 'db_oltp' AND order_line_source_id = 4103 AND NOT is_deleted
+  ) THEN
+    RAISE EXCEPTION 'Hard delete: fixture line 4103 must be live before the id snapshot';
+  END IF;
+END;
+$$;
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('cccccccc-cccc-cccc-cccc-cccccccccccc', 'db_oltp', '2026-09-05 12:00+07', '2026-09-06 12:00+07');
+
+INSERT INTO stg.order_line_ids (batch_id, source_id, order_source_id)
+SELECT 'cccccccc-cccc-cccc-cccc-cccccccccccc', line.order_line_source_id, order_fact.order_source_id
+FROM dw.fact_order_line AS line
+JOIN dw.fact_order AS order_fact ON order_fact.order_key = line.order_key
+WHERE line.source_system = 'db_oltp' AND line.order_line_source_id <> 4103;
+
+SELECT * FROM etl.apply_sales_stock_batch('cccccccc-cccc-cccc-cccc-cccccccccccc');
+
+DO $$
+BEGIN
+  IF (SELECT status FROM etl.load_batch WHERE batch_id = 'cccccccc-cccc-cccc-cccc-cccccccccccc') <> 'SUCCEEDED' THEN
+    RAISE EXCEPTION 'Hard delete: id snapshot batch must succeed';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.fact_order_line
+    WHERE source_system = 'db_oltp' AND order_line_source_id = 4103 AND is_deleted
+      AND last_loaded_batch_id = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+  ) OR (
+    SELECT COUNT(*) FROM dw.fact_order_line WHERE source_system = 'db_oltp' AND is_deleted
+  ) <> (SELECT deleted_lines + 1 FROM line_delete_before) THEN
+    RAISE EXCEPTION 'Hard delete: only the line missing from the id snapshot may be marked deleted';
+  END IF;
+  IF (
+    SELECT COALESCE(SUM(units_sold), 0) FROM mart.v_sales_sku_daily
+    WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS'
+  ) <> (SELECT units_sold - 1 FROM line_delete_before) OR (
+    SELECT COALESCE(SUM(line_subtotal_amount), 0) FROM mart.v_sales_sku_daily
+    WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS'
+  ) <> (SELECT line_sales - 60 FROM line_delete_before) THEN
+    RAISE EXCEPTION 'Hard delete: line marts must drop the deleted line (1 unit, 60)';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM etl.snapshot_state
+    WHERE source_system = 'db_oltp' AND entity_name = 'order_line_ids'
+      AND snapshot_at = '2026-09-06 12:00+07'::TIMESTAMPTZ
+      AND last_successful_batch_id = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+  ) THEN
+    RAISE EXCEPTION 'Hard delete: the line-id snapshot marker must advance to the applied batch';
+  END IF;
+END;
+$$;
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('dddddddd-dddd-dddd-dddd-dddddddddddd', 'db_oltp', '2026-09-03 00:00+07', '2026-09-04 10:00+07');
+
+INSERT INTO stg.order_lines (
+  batch_id, source_id, order_source_id, sku_source_id, quantity, unit_price,
+  line_discount_amount, line_subtotal_amount, deleted_at, source_updated_at,
+  promotion_source_id, promotion_category_source_id
+)
+VALUES ('dddddddd-dddd-dddd-dddd-dddddddddddd', 4103, 3016, 101, 1, 60, 0, 60, NULL, '2026-09-03 09:31+07', NULL, NULL);
+
+INSERT INTO stg.order_line_ids (batch_id, source_id, order_source_id)
+SELECT 'dddddddd-dddd-dddd-dddd-dddddddddddd', line.order_line_source_id, order_fact.order_source_id
+FROM dw.fact_order_line AS line
+JOIN dw.fact_order AS order_fact ON order_fact.order_key = line.order_key
+WHERE line.source_system = 'db_oltp';
+
+SELECT * FROM etl.apply_sales_stock_batch('dddddddd-dddd-dddd-dddd-dddddddddddd');
+
+DO $$
+BEGIN
+  IF (SELECT status FROM etl.load_batch WHERE batch_id = 'dddddddd-dddd-dddd-dddd-dddddddddddd') <> 'SUCCEEDED' THEN
+    RAISE EXCEPTION 'Hard delete: older replay batch must succeed';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM dw.fact_order_line
+    WHERE source_system = 'db_oltp' AND order_line_source_id = 4103 AND is_deleted
+  ) THEN
+    RAISE EXCEPTION 'Hard delete: an older replay resurrected a line deleted by a newer id snapshot';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM etl.snapshot_state
+    WHERE source_system = 'db_oltp' AND entity_name = 'order_line_ids'
+      AND snapshot_at = '2026-09-06 12:00+07'::TIMESTAMPTZ
+      AND last_successful_batch_id = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+  ) THEN
+    RAISE EXCEPTION 'Hard delete: an older id snapshot moved the snapshot marker back';
+  END IF;
+END;
+$$;
+
+CREATE TEMP TABLE line_state_before_empty AS
+SELECT order_line_source_id, is_deleted
+FROM dw.fact_order_line
+WHERE source_system = 'db_oltp';
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', 'db_oltp', '2026-09-06 12:00+07', '2026-09-07 12:00+07');
+
+-- No ids staged: the snapshot is skipped instead of deleting every line.
+SELECT * FROM etl.apply_sales_stock_batch('eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee');
+
+DO $$
+BEGIN
+  IF (SELECT status FROM etl.load_batch WHERE batch_id = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee') <> 'SUCCEEDED' THEN
+    RAISE EXCEPTION 'Hard delete: batch without an id snapshot must succeed';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM dw.fact_order_line AS line
+    JOIN line_state_before_empty AS before
+      ON before.order_line_source_id = line.order_line_source_id
+    WHERE line.source_system = 'db_oltp' AND line.is_deleted <> before.is_deleted
+  ) THEN
+    RAISE EXCEPTION 'Hard delete: a batch without an id snapshot changed line deletion state';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM etl.snapshot_state
+    WHERE source_system = 'db_oltp' AND entity_name = 'order_line_ids'
+      AND snapshot_at = '2026-09-06 12:00+07'::TIMESTAMPTZ
+      AND last_successful_batch_id = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+  ) THEN
+    RAISE EXCEPTION 'Hard delete: a batch without an id snapshot moved the snapshot marker';
+  END IF;
+END;
+$$;
+
+-- Whole orders deleted directly in the source: an order missing from the
+-- order id snapshot is marked deleted with its lines and social fact, drops
+-- out of the marts, and stays deleted through an older replay.
+CREATE TEMP TABLE order_delete_before AS
+SELECT
+  (SELECT COUNT(*) FROM dw.fact_order WHERE source_system = 'db_oltp' AND is_deleted) AS deleted_orders,
+  (SELECT COALESCE(SUM(booked_order_count), 0) FROM mart.v_sales_daily
+   WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS') AS pos_orders,
+  (SELECT COALESCE(SUM(booked_sales_amount), 0) FROM mart.v_sales_daily
+   WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS') AS pos_sales,
+  (SELECT COALESCE(SUM(booked_sales_amount), 0) FROM mart.v_sales_daily
+   WHERE business_date = DATE '2026-08-01' AND channel_code = 'Facebook') AS fb_sales;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM dw.fact_order WHERE order_source_id = 3015 AND NOT is_deleted)
+     OR NOT EXISTS (SELECT 1 FROM dw.fact_order WHERE order_source_id = 3012 AND NOT is_deleted)
+     OR NOT EXISTS (SELECT 1 FROM dw.fact_social_order WHERE order_source_id = 3012 AND NOT is_deleted)
+     OR NOT EXISTS (SELECT 1 FROM mart.v_social_order_action WHERE order_source_id = 3012) THEN
+    RAISE EXCEPTION 'Order delete: fixture orders 3015 and 3012 must be live before the order snapshot';
+  END IF;
+END;
+$$;
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('12121212-1212-1212-1212-121212121212', 'db_oltp', '2026-09-07 12:00+07', '2026-09-08 12:00+07');
+
+INSERT INTO stg.order_ids (batch_id, source_id)
+SELECT '12121212-1212-1212-1212-121212121212', order_source_id
+FROM dw.fact_order
+WHERE source_system = 'db_oltp' AND order_source_id NOT IN (3012, 3015);
+
+SELECT * FROM etl.apply_sales_stock_batch('12121212-1212-1212-1212-121212121212');
+
+DO $$
+BEGIN
+  IF (SELECT status FROM etl.load_batch WHERE batch_id = '12121212-1212-1212-1212-121212121212') <> 'SUCCEEDED' THEN
+    RAISE EXCEPTION 'Order delete: order snapshot batch must succeed';
+  END IF;
+  IF (SELECT COUNT(*) FROM dw.fact_order WHERE source_system = 'db_oltp' AND is_deleted)
+       <> (SELECT deleted_orders + 2 FROM order_delete_before)
+     OR EXISTS (
+       SELECT 1 FROM dw.fact_order
+       WHERE order_source_id IN (3012, 3015)
+         AND (NOT is_deleted OR source_updated_at < '2026-09-08 12:00+07'::TIMESTAMPTZ)
+     ) THEN
+    RAISE EXCEPTION 'Order delete: exactly the orders missing from the snapshot must be marked deleted and pinned';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM dw.fact_order_line AS line
+    JOIN dw.fact_order AS o ON o.order_key = line.order_key
+    WHERE o.order_source_id IN (3012, 3015) AND NOT line.is_deleted
+  ) THEN
+    RAISE EXCEPTION 'Order delete: lines of a deleted order must be marked deleted';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM dw.fact_social_order WHERE order_source_id = 3012 AND is_deleted)
+     OR EXISTS (SELECT 1 FROM mart.v_social_order_action WHERE order_source_id = 3012)
+     OR EXISTS (SELECT 1 FROM mart.v_social_order_status WHERE order_source_id = 3012 AND NOT is_deleted) THEN
+    RAISE EXCEPTION 'Order delete: a deleted Facebook order must leave the social marts';
+  END IF;
+  IF (SELECT COALESCE(SUM(booked_order_count), 0) FROM mart.v_sales_daily
+      WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS')
+       <> (SELECT pos_orders - 1 FROM order_delete_before)
+     OR (SELECT COALESCE(SUM(booked_sales_amount), 0) FROM mart.v_sales_daily
+         WHERE business_date = DATE '2026-09-03' AND channel_code = 'POS')
+       <> (SELECT pos_sales - 290 FROM order_delete_before)
+     OR (SELECT COALESCE(SUM(booked_sales_amount), 0) FROM mart.v_sales_daily
+         WHERE business_date = DATE '2026-08-01' AND channel_code = 'Facebook')
+       <> (SELECT fb_sales - 300 FROM order_delete_before) THEN
+    RAISE EXCEPTION 'Order delete: booked sales must drop by the deleted orders (POS 290, Facebook 300)';
+  END IF;
+  IF EXISTS (SELECT 1 FROM mart.v_order_operational_detail WHERE order_source_id IN (3012, 3015))
+     OR EXISTS (SELECT 1 FROM mart.v_customer_purchase_line WHERE order_source_id IN (3012, 3015)) THEN
+    RAISE EXCEPTION 'Order delete: a deleted order leaked into order or purchase-line marts';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM etl.snapshot_state
+    WHERE source_system = 'db_oltp' AND entity_name = 'order_ids'
+      AND snapshot_at = '2026-09-08 12:00+07'::TIMESTAMPTZ
+      AND last_successful_batch_id = '12121212-1212-1212-1212-121212121212'
+  ) THEN
+    RAISE EXCEPTION 'Order delete: the order snapshot marker must advance to the applied batch';
+  END IF;
+END;
+$$;
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('13131313-1313-1313-1313-131313131313', 'db_oltp', '2026-09-03 00:00+07', '2026-09-04 10:00+07');
+
+INSERT INTO stg.orders (
+  batch_id, source_id, order_number, order_at, current_status, channel_source_id,
+  subtotal_amount, discount_amount, total_amount, source_updated_at
+)
+VALUES ('13131313-1313-1313-1313-131313131313', 3015, 'PROMO-3015', '2026-09-03 09:00+07', 'completed', 1, 290, 0, 290, '2026-09-03 09:01+07');
+
+INSERT INTO stg.order_lines (
+  batch_id, source_id, order_source_id, sku_source_id, quantity, unit_price,
+  line_discount_amount, line_subtotal_amount, deleted_at, source_updated_at,
+  promotion_source_id, promotion_category_source_id
+)
+VALUES ('13131313-1313-1313-1313-131313131313', 4101, 3015, 101, 2, 100, 0, 200, NULL, '2026-09-03 09:01+07', 9201, 9301);
+
+INSERT INTO stg.order_ids (batch_id, source_id)
+SELECT '13131313-1313-1313-1313-131313131313', order_source_id
+FROM dw.fact_order
+WHERE source_system = 'db_oltp';
+
+SELECT * FROM etl.apply_sales_stock_batch('13131313-1313-1313-1313-131313131313');
+
+DO $$
+BEGIN
+  IF (SELECT status FROM etl.load_batch WHERE batch_id = '13131313-1313-1313-1313-131313131313') <> 'SUCCEEDED' THEN
+    RAISE EXCEPTION 'Order delete: older replay batch must succeed';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM dw.fact_order WHERE order_source_id = 3015 AND is_deleted)
+     OR NOT EXISTS (SELECT 1 FROM dw.fact_order WHERE order_source_id = 3012 AND is_deleted)
+     OR NOT EXISTS (SELECT 1 FROM dw.fact_order_line WHERE order_line_source_id = 4101 AND is_deleted)
+     OR NOT EXISTS (SELECT 1 FROM dw.fact_social_order WHERE order_source_id = 3012 AND is_deleted) THEN
+    RAISE EXCEPTION 'Order delete: an older replay resurrected a deleted order, line, or social fact';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM etl.snapshot_state
+    WHERE source_system = 'db_oltp' AND entity_name = 'order_ids'
+      AND last_successful_batch_id = '12121212-1212-1212-1212-121212121212'
+  ) THEN
+    RAISE EXCEPTION 'Order delete: an older order snapshot moved the marker back';
+  END IF;
+END;
+$$;
+
+CREATE TEMP TABLE order_state_before_empty AS
+SELECT order_source_id, is_deleted FROM dw.fact_order WHERE source_system = 'db_oltp';
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('14141414-1414-1414-1414-141414141414', 'db_oltp', '2026-09-08 12:00+07', '2026-09-09 12:00+07');
+
+-- No order ids staged: the order snapshot is skipped instead of deleting every order.
+SELECT * FROM etl.apply_sales_stock_batch('14141414-1414-1414-1414-141414141414');
+
+DO $$
+BEGIN
+  IF (SELECT status FROM etl.load_batch WHERE batch_id = '14141414-1414-1414-1414-141414141414') <> 'SUCCEEDED' THEN
+    RAISE EXCEPTION 'Order delete: batch without an order snapshot must succeed';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM dw.fact_order AS o
+    JOIN order_state_before_empty AS before ON before.order_source_id = o.order_source_id
+    WHERE o.source_system = 'db_oltp' AND o.is_deleted <> before.is_deleted
+  ) OR NOT EXISTS (
+    SELECT 1 FROM etl.snapshot_state
+    WHERE source_system = 'db_oltp' AND entity_name = 'order_ids'
+      AND last_successful_batch_id = '12121212-1212-1212-1212-121212121212'
+  ) THEN
+    RAISE EXCEPTION 'Order delete: a batch without an order snapshot changed order state or its marker';
+  END IF;
+END;
+$$;
+
+-- Reused source ids (OLTP reset): a staged order whose id is already in the
+-- warehouse under another order_number fails the whole batch untouched; the
+-- same order_number is an ordinary update.
+CREATE TEMP TABLE reused_id_before AS
+SELECT
+  (SELECT fact_order::TEXT FROM dw.fact_order WHERE source_system = 'db_oltp' AND order_source_id = 3016) AS order_row,
+  (SELECT COUNT(*) FROM dw.fact_order_line WHERE source_system = 'db_oltp') AS line_count,
+  (SELECT COUNT(*) FROM dw.fact_order WHERE source_system = 'db_oltp') AS order_count;
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('15151515-1515-1515-1515-151515151515', 'db_oltp', '2026-09-09 12:00+07', '2026-10-12 12:00+07');
+
+INSERT INTO stg.orders (
+  batch_id, source_id, order_number, order_at, current_status, channel_source_id,
+  subtotal_amount, discount_amount, total_amount, source_updated_at
+)
+VALUES
+  ('15151515-1515-1515-1515-151515151515', 3016, 'ORD-AFTER-RESET', '2026-10-11 10:00+07', 'pending', 1, 700, 0, 700, '2026-10-11 10:01+07'),
+  ('15151515-1515-1515-1515-151515151515', 3999, 'ORD-NEW-3999', '2026-10-11 11:00+07', 'pending', 1, 100, 0, 100, '2026-10-11 11:01+07');
+
+INSERT INTO stg.order_lines (
+  batch_id, source_id, order_source_id, sku_source_id, quantity, unit_price,
+  line_discount_amount, line_subtotal_amount, deleted_at, source_updated_at,
+  promotion_source_id, promotion_category_source_id
+)
+VALUES ('15151515-1515-1515-1515-151515151515', 4999, 3999, 101, 1, 100, 0, 100, NULL, '2026-10-11 11:01+07', NULL, NULL);
+
+SELECT * FROM etl.apply_sales_stock_batch('15151515-1515-1515-1515-151515151515');
+
+DO $$
+BEGIN
+  IF (SELECT status FROM etl.load_batch WHERE batch_id = '15151515-1515-1515-1515-151515151515') <> 'FAILED'
+     OR (SELECT error_message FROM etl.load_batch WHERE batch_id = '15151515-1515-1515-1515-151515151515')
+          NOT LIKE 'Source order ids were reused: 1 staged order(s)%' THEN
+    RAISE EXCEPTION 'Reused id: a staged order id with another order_number must fail the batch with a counts-only message';
+  END IF;
+  IF (SELECT fact_order::TEXT FROM dw.fact_order WHERE source_system = 'db_oltp' AND order_source_id = 3016)
+       IS DISTINCT FROM (SELECT order_row FROM reused_id_before)
+     OR EXISTS (SELECT 1 FROM dw.fact_order WHERE order_source_id = 3999)
+     OR (SELECT COUNT(*) FROM dw.fact_order WHERE source_system = 'db_oltp') <> (SELECT order_count FROM reused_id_before)
+     OR (SELECT COUNT(*) FROM dw.fact_order_line WHERE source_system = 'db_oltp') <> (SELECT line_count FROM reused_id_before) THEN
+    RAISE EXCEPTION 'Reused id: a failed batch must leave every warehouse order and line unchanged';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM etl.watermark
+    WHERE source_system = 'db_oltp' AND last_successful_batch_id = '15151515-1515-1515-1515-151515151515'
+  ) THEN
+    RAISE EXCEPTION 'Reused id: a failed batch must not advance watermarks';
+  END IF;
+END;
+$$;
+
+INSERT INTO etl.load_batch (batch_id, source_system, source_window_started_at, source_window_ended_at)
+VALUES ('16161616-1616-1616-1616-161616161616', 'db_oltp', '2026-09-09 12:00+07', '2026-09-10 12:00+07');
+
+INSERT INTO stg.orders (
+  batch_id, source_id, order_number, order_at, current_status, channel_source_id,
+  subtotal_amount, discount_amount, total_amount, source_updated_at
+)
+VALUES ('16161616-1616-1616-1616-161616161616', 3016, 'PROMO-3016', '2026-09-03 09:30+07', 'cancelled', 1, 60, 0, 60, '2026-09-10 09:00+07');
+
+SELECT * FROM etl.apply_sales_stock_batch('16161616-1616-1616-1616-161616161616');
+
+DO $$
+BEGIN
+  IF (SELECT status FROM etl.load_batch WHERE batch_id = '16161616-1616-1616-1616-161616161616') <> 'SUCCEEDED'
+     OR NOT EXISTS (
+       SELECT 1 FROM dw.fact_order
+       WHERE source_system = 'db_oltp' AND order_source_id = 3016
+         AND order_number = 'PROMO-3016' AND is_cancelled
+         AND last_loaded_batch_id = '16161616-1616-1616-1616-161616161616'
+     ) THEN
+    RAISE EXCEPTION 'Reused id: the same order_number must update the existing order normally';
+  END IF;
+END;
+$$;
+
 ROLLBACK;

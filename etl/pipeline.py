@@ -88,7 +88,8 @@ WAREHOUSE_CONTRACTS: dict[tuple[str, str], tuple[str, ...]] = {
     ),
     ("dw", "fact_order_line"): (
         "source_system", "order_line_source_id", "promotion_source_id",
-        "promotion_category_source_id", "promotion_key",
+        "promotion_category_source_id", "promotion_key", "is_deleted",
+        "source_updated_at", "last_loaded_batch_id",
     ),
     ("dw", "fact_promotion_daily_snapshot"): (
         "snapshot_date_key", "promotion_key", "captured_at", "discount_type", "discount_value",
@@ -105,6 +106,7 @@ WAREHOUSE_CONTRACTS: dict[tuple[str, str], tuple[str, ...]] = {
     ),
     ("dw", "fact_order"): (
         "customer_key", "buyer_source_id", "province_name", "return_received_at",
+        "is_deleted", "source_updated_at", "last_loaded_batch_id",
     ),
     ("dw", "fact_facebook_reserve"): (
         "source_system", "reserve_source_id", "order_source_id", "created_at", "reserved_until",
@@ -556,6 +558,39 @@ DATASETS: tuple[DatasetSpec, ...] = (
             ORDER BY updated_at, id
         """,
     ),
+    # The backend hard-deletes some order_details rows (removed items, cleared
+    # gift lines), which the incremental extract above can never report. This
+    # id snapshot lets the transform mark those warehouse lines as deleted.
+    DatasetSpec(
+        name="order_line_ids",
+        staging_table="order_line_ids",
+        columns=("batch_id", "source_id", "order_source_id"),
+        full_snapshot=True,
+        required_columns=("source_id", "order_source_id"),
+        key_columns=("source_id",),
+        query="""
+            SELECT
+              id::bigint AS source_id,
+              orders_id::bigint AS order_source_id
+            FROM order_details
+            ORDER BY id
+        """,
+    ),
+    # Whole orders are sometimes deleted directly in the database (test orders);
+    # the transform marks warehouse orders missing from this snapshot deleted.
+    DatasetSpec(
+        name="order_ids",
+        staging_table="order_ids",
+        columns=("batch_id", "source_id"),
+        full_snapshot=True,
+        required_columns=("source_id",),
+        key_columns=("source_id",),
+        query="""
+            SELECT id::bigint AS source_id
+            FROM orders
+            ORDER BY id
+        """,
+    ),
     DatasetSpec(
         name="inventory_movements",
         staging_table="inventory_movements",
@@ -969,14 +1004,38 @@ LEFT JOIN dw.dim_date dd ON dd.date_key = o.delivered_date_key
 WHERE o.source_system = %s ORDER BY o.order_source_id
 """
 
+# Order totals can agree while line rows do not (a hard-deleted line stays in
+# the warehouse), so live lines are reconciled separately. Lines of a
+# hard-deleted order are flagged with it, so they drop out of the target side.
+RECONCILE_LINE_SOURCE_SQL = """
+SELECT id, orders_id, subtotal FROM order_details WHERE deleted_at IS NULL ORDER BY id
+"""
 
-def _assert_reconciled(source_rows: list[tuple], target_rows: list[tuple]) -> None:
+RECONCILE_LINE_TARGET_SQL = """
+SELECT l.order_line_source_id, o.order_source_id, l.line_subtotal_amount
+FROM dw.fact_order_line l JOIN dw.fact_order o ON o.order_key = l.order_key
+WHERE l.source_system = %s AND NOT l.is_deleted ORDER BY l.order_line_source_id
+"""
+
+
+def _without_hard_deleted_orders(source_rows: list[tuple], target_rows: list[tuple]) -> list[tuple]:
+    """Drop warehouse orders flagged deleted (column 6) that no longer exist in the source.
+
+    Orders deleted directly in the OLTP database stay in the warehouse as
+    is_deleted; a warehouse order that is missing from the source but still
+    live is kept, so reconciliation fails on it.
+    """
+    source_ids = {row[0] for row in source_rows}
+    return [row for row in target_rows if row[0] in source_ids or not row[6]]
+
+
+def _assert_reconciled(source_rows: list[tuple], target_rows: list[tuple], label: str = "Order/date/channel") -> None:
     expected = {row[0]: row[1:] for row in source_rows}
     actual = {row[0]: row[1:] for row in target_rows}
     mismatches = sum(expected.get(key) != actual.get(key) for key in expected.keys() | actual.keys())
     if len(expected) != len(source_rows) or len(actual) != len(target_rows) or mismatches:
         # Counts only: no customer identifiers or payment evidence in logs.
-        raise RuntimeError(f"Order/date/channel reconciliation failed: source={len(source_rows)} warehouse={len(target_rows)} mismatched={mismatches}")
+        raise RuntimeError(f"{label} reconciliation failed: source={len(source_rows)} warehouse={len(target_rows)} mismatched={mismatches}")
 
 
 def _assert_delivery_evidence(source_rows: list[tuple], target_rows: list[tuple], unverifiable_estimates: int) -> None:
@@ -1003,19 +1062,25 @@ def reconcile_warehouse(settings: Settings) -> None:
         if status != ('SUCCEEDED',):
             raise RuntimeError('Reconciliation requires the latest source batch to be SUCCEEDED')
         expected = source.execute(RECONCILE_SOURCE_SQL).fetchall()
-        actual = target.execute(RECONCILE_TARGET_SQL, (settings.source_system,)).fetchall()
+        actual = _without_hard_deleted_orders(
+            expected, target.execute(RECONCILE_TARGET_SQL, (settings.source_system,)).fetchall())
         unverifiable = target.execute("""
             SELECT COUNT(*) FROM dw.fact_order o
             JOIN dw.dim_channel c ON c.channel_key = o.channel_key
             WHERE o.source_system = %s AND o.delivered_at IS NOT NULL
+              AND NOT o.is_deleted  -- deleted orders are in no mart
               AND o.delivery_timestamp_source = 'ORDER_UPDATED_AT_ESTIMATE'
               AND UPPER(BTRIM(c.channel_code)) <> 'POS'
         """, (settings.source_system,)).fetchone()[0]
         _assert_delivery_evidence(expected, actual, unverifiable)
         _assert_reconciled(expected, actual)
+        expected_lines = source.execute(RECONCILE_LINE_SOURCE_SQL).fetchall()
+        actual_lines = target.execute(RECONCILE_LINE_TARGET_SQL, (settings.source_system,)).fetchall()
+        _assert_reconciled(expected_lines, actual_lines, "Order line")
         # Equality per order includes dates, channel, cancellation/deletion and
         # exact decimal value, so all their daily gross totals agree as well.
         delivered = [row for row in expected if row[3] is not None and not row[6]]
-        LOGGER.info('reconciled orders=%d delivered_orders=%d gross=%s physical_returns=%d',
-                    len(expected), len(delivered), sum((row[7] for row in delivered), Decimal('0')),
+        LOGGER.info('reconciled orders=%d lines=%d delivered_orders=%d gross=%s physical_returns=%d',
+                    len(expected), len(expected_lines), len(delivered),
+                    sum((row[7] for row in delivered), Decimal('0')),
                     sum(row[4] is not None for row in expected))

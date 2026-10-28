@@ -5,6 +5,7 @@ import sys
 import unittest
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -12,7 +13,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from etl.config import Settings, normalize_postgres_url
-from etl.pipeline import DATASETS, SOURCE_CONTRACTS, WAREHOUSE_CONTRACTS, _assert_delivery_evidence, _assert_reconciled, _python_value, exit_code_for_status, prepare_frame
+from etl.pipeline import DATASETS, SOURCE_CONTRACTS, WAREHOUSE_CONTRACTS, _assert_delivery_evidence, _assert_reconciled, _python_value, _without_hard_deleted_orders, exit_code_for_status, prepare_frame
 from etl.__main__ import main
 
 
@@ -263,6 +264,70 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn(field, WAREHOUSE_CONTRACTS[("mart", "v_promotion")])
             self.assertNotIn(field, WAREHOUSE_CONTRACTS[("mart", "v_sales_promotion_daily")])
 
+    def test_hard_deleted_order_lines_use_full_id_snapshot(self) -> None:
+        specs = {item.name: item for item in DATASETS}
+        ids = specs["order_line_ids"]
+        self.assertTrue(ids.full_snapshot)
+        self.assertEqual(ids.columns, ("batch_id", "source_id", "order_source_id"))
+        self.assertEqual(ids.key_columns, ("source_id",))
+        self.assertEqual(ids.required_columns, ("source_id", "order_source_id"))
+        self.assertIn("id::bigint AS source_id", ids.query)
+        self.assertIn("orders_id::bigint AS order_source_id", ids.query)
+        self.assertIn("FROM order_details", ids.query)
+        # Soft-deleted lines still exist; only rows gone from the source count as deleted.
+        self.assertNotIn("WHERE", ids.query)
+        self.assertTrue({"is_deleted", "source_updated_at"}.issubset(WAREHOUSE_CONTRACTS[("dw", "fact_order_line")]))
+
+        sql = (Path(__file__).parents[1] / "warehouse" / "002_transform.sql").read_text(encoding="utf-8")
+        self.assertIn("SELECT 1 FROM stg.order_line_ids WHERE stg.order_line_ids.batch_id = p_batch_id", sql)
+        self.assertIn("state.entity_name = 'order_line_ids'", sql)
+        self.assertIn("IF v_apply_order_line_snapshot THEN", sql)
+        self.assertIn("source_updated_at = GREATEST(line.source_updated_at, v_batch.source_window_ended_at)", sql)
+        self.assertIn("AND staged.source_id = line.order_line_source_id", sql)
+        self.assertLess(
+            sql.index("INSERT INTO dw.fact_order_line"),
+            sql.index("IF v_apply_order_line_snapshot THEN"),
+        )
+
+    def test_hard_deleted_orders_use_full_id_snapshot(self) -> None:
+        ids = next(item for item in DATASETS if item.name == "order_ids")
+        self.assertTrue(ids.full_snapshot)
+        self.assertEqual(ids.columns, ("batch_id", "source_id"))
+        self.assertEqual(ids.key_columns, ("source_id",))
+        self.assertIn("SELECT id::bigint AS source_id", ids.query)
+        self.assertIn("FROM orders", ids.query)
+        # Soft-deleted orders still exist in the source and keep their own flag.
+        self.assertNotIn("WHERE", ids.query)
+        self.assertTrue({"is_deleted", "source_updated_at"}.issubset(WAREHOUSE_CONTRACTS[("dw", "fact_order")]))
+
+        sql = (Path(__file__).parents[1] / "warehouse" / "002_transform.sql").read_text(encoding="utf-8")
+        self.assertIn("SELECT 1 FROM stg.order_ids WHERE stg.order_ids.batch_id = p_batch_id", sql)
+        self.assertIn("state.entity_name = 'order_ids'", sql)
+        block = sql[sql.index("IF v_apply_order_snapshot THEN"):]
+        block = block[:block.index("END IF;")]
+        for statement in ("UPDATE dw.fact_order AS o", "UPDATE dw.fact_order_line AS line",
+                          "UPDATE dw.fact_social_order AS social"):
+            self.assertIn(statement, block)
+        self.assertIn("source_updated_at = GREATEST(o.source_updated_at, v_batch.source_window_ended_at)", block)
+        # Marked after both upserts and before the social fact is recomputed.
+        self.assertLess(sql.index("INSERT INTO dw.fact_order_line"), sql.index("IF v_apply_order_snapshot THEN"))
+        self.assertLess(sql.index("IF v_apply_order_snapshot THEN"), sql.index("INSERT INTO dw.fact_social_order"))
+
+    def test_reused_order_ids_fail_the_batch_before_any_warehouse_write(self) -> None:
+        sql = (Path(__file__).parents[1] / "warehouse" / "002_transform.sql").read_text(encoding="utf-8")
+        guard = sql.index("SELECT COUNT(*) INTO v_reused_order_count")
+        self.assertIn("staged.order_number IS DISTINCT FROM existing.order_number", sql)
+        self.assertIn("RAISE EXCEPTION 'Source order ids were reused: %", sql)
+        self.assertIn("warehouse-rebuild-after-oltp-reset.md", sql)
+        # Inside the batch's exception block, ahead of the first dw write, so a
+        # failure marks the batch FAILED and leaves the warehouse untouched.
+        self.assertLess(sql.index("BEGIN\n    v_apply_promotion_category_snapshot"), guard)
+        self.assertLess(guard, sql.index("INSERT INTO dw."))
+        message = sql[sql.index("RAISE EXCEPTION 'Source order ids were reused"):]
+        message = message[:message.index(";")]
+        for restricted in ("buyer", "customer", "order_source_id"):
+            self.assertNotIn(restricted, message)
+
     def test_customer_dimension_is_part_of_warehouse_contract(self) -> None:
         self.assertIn("customer_source_id", WAREHOUSE_CONTRACTS[("dw", "dim_customer")])
         self.assertIn("customer_key", WAREHOUSE_CONTRACTS[("dw", "fact_order")])
@@ -311,6 +376,38 @@ class PipelineTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, 'reconciliation failed'):
                 _assert_reconciled(correct, wrong)
+
+    def test_line_reconciliation_detects_line_left_after_source_hard_delete(self) -> None:
+        source = [(38, 28, Decimal('350.00')), (39, 28, Decimal('350.00'))]
+        _assert_reconciled(source, [(38, 28, Decimal('350')), (39, 28, Decimal('350'))], "Order line")
+        for wrong in (
+            source + [(37, 28, Decimal('700.00'))],
+            [(38, 28, Decimal('350.00')), (39, 28, Decimal('300.00'))],
+            source[:1],
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'Order line reconciliation failed'):
+                _assert_reconciled(source, wrong, "Order line")
+
+    def test_order_reconciliation_skips_flagged_hard_deleted_orders_only(self) -> None:
+        # (id, channel, order_at, delivered_at, received_at, is_cancelled, is_deleted, total)
+        live = (1, 'POS', 'at', None, None, False, False, Decimal('700'))
+        source = [live]
+        flagged_gone = (2, 'Facebook', 'at', None, None, False, True, Decimal('1'))
+        live_gone = (3, 'POS', 'at', None, None, False, False, Decimal('700'))
+
+        kept = _without_hard_deleted_orders(source, [live, flagged_gone])
+        self.assertEqual(kept, [live])
+        _assert_reconciled(source, kept)
+
+        kept = _without_hard_deleted_orders(source, [live, live_gone])
+        with self.assertRaisesRegex(RuntimeError, 'reconciliation failed'):
+            _assert_reconciled(source, kept)
+
+        # A warehouse order flagged deleted while the source still has it live is a mismatch.
+        wrongly_flagged = live[:6] + (True,) + live[7:]
+        kept = _without_hard_deleted_orders(source, [wrongly_flagged])
+        with self.assertRaisesRegex(RuntimeError, 'reconciliation failed'):
+            _assert_reconciled(source, kept)
 
     def test_lost_checkout_history_is_reported_as_incomplete_not_a_timezone_bug(self) -> None:
         source = [(1, 'POS', 'order_at', None)]

@@ -617,6 +617,23 @@ CREATE TABLE IF NOT EXISTS stg.order_lines (
 ALTER TABLE stg.order_lines ADD COLUMN IF NOT EXISTS promotion_source_id BIGINT;
 ALTER TABLE stg.order_lines ADD COLUMN IF NOT EXISTS promotion_category_source_id BIGINT;
 
+-- Full id snapshot of order_details per batch; lets the transform mark lines
+-- that were hard-deleted in the source.
+CREATE TABLE IF NOT EXISTS stg.order_line_ids (
+  batch_id UUID NOT NULL REFERENCES etl.load_batch(batch_id),
+  source_id BIGINT NOT NULL,
+  order_source_id BIGINT NOT NULL,
+  PRIMARY KEY (batch_id, source_id)
+);
+
+-- Full id snapshot of orders per batch; same purpose for whole orders deleted
+-- directly in the source database.
+CREATE TABLE IF NOT EXISTS stg.order_ids (
+  batch_id UUID NOT NULL REFERENCES etl.load_batch(batch_id),
+  source_id BIGINT NOT NULL,
+  PRIMARY KEY (batch_id, source_id)
+);
+
 CREATE TABLE IF NOT EXISTS stg.promotions (
   batch_id UUID NOT NULL REFERENCES etl.load_batch(batch_id),
   promotion_source_id BIGINT NOT NULL,

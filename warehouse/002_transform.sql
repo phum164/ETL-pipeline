@@ -8,6 +8,9 @@ DECLARE
   v_rejected_count BIGINT := 0;
   v_error TEXT;
   v_apply_promotion_category_snapshot BOOLEAN := FALSE;
+  v_apply_order_line_snapshot BOOLEAN := FALSE;
+  v_apply_order_snapshot BOOLEAN := FALSE;
+  v_reused_order_count BIGINT := 0;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('warehouse_db:apply_sales_stock_batch'));
 
@@ -43,12 +46,60 @@ BEGIN
         )
     );
 
+    -- Unlike category pairs, an empty line-id snapshot is skipped, not applied:
+    -- a source with no order lines at all is not a real state, and applying it
+    -- would mark every warehouse line deleted.
+    v_apply_order_line_snapshot := EXISTS (
+      SELECT 1 FROM stg.order_line_ids WHERE stg.order_line_ids.batch_id = p_batch_id
+    ) AND NOT EXISTS (
+      SELECT 1
+      FROM etl.snapshot_state AS state
+      WHERE state.source_system = v_batch.source_system
+        AND state.entity_name = 'order_line_ids'
+        AND (
+          state.snapshot_at > v_batch.source_window_ended_at
+          OR (state.snapshot_at = v_batch.source_window_ended_at
+              AND state.snapshot_created_at >= v_batch.created_at)
+        )
+    );
+
+    -- Same rules for whole orders, including skipping an empty snapshot.
+    v_apply_order_snapshot := EXISTS (
+      SELECT 1 FROM stg.order_ids WHERE stg.order_ids.batch_id = p_batch_id
+    ) AND NOT EXISTS (
+      SELECT 1
+      FROM etl.snapshot_state AS state
+      WHERE state.source_system = v_batch.source_system
+        AND state.entity_name = 'order_ids'
+        AND (
+          state.snapshot_at > v_batch.source_window_ended_at
+          OR (state.snapshot_at = v_batch.source_window_ended_at
+              AND state.snapshot_created_at >= v_batch.created_at)
+        )
+    );
+
     IF EXISTS (
       SELECT 1 FROM stg.sales_channels
       WHERE stg.sales_channels.batch_id = p_batch_id
         AND COALESCE(BTRIM(code), '') = ''
     ) THEN
       RAISE EXCEPTION 'sales_channels contains a blank code';
+    END IF;
+
+    -- order_number is set once at creation and unique, so a known source id
+    -- arriving with another number means the OLTP ids restarted (database
+    -- reset). Upserting would merge new orders into old facts (e.g. keep an
+    -- old delivered date), so fail before anything is written. Counts only.
+    SELECT COUNT(*) INTO v_reused_order_count
+    FROM stg.orders AS staged
+    JOIN dw.fact_order AS existing
+      ON existing.source_system = v_batch.source_system
+     AND existing.order_source_id = staged.source_id
+    WHERE staged.batch_id = p_batch_id
+      AND staged.order_number IS DISTINCT FROM existing.order_number;
+
+    IF v_reused_order_count > 0 THEN
+      RAISE EXCEPTION 'Source order ids were reused: % staged order(s) match a warehouse order id with a different order_number. The OLTP database was probably reset; rebuild the warehouse (docs/handoffs/warehouse-rebuild-after-oltp-reset.md) before loading.', v_reused_order_count;
     END IF;
 
     PERFORM etl.ensure_dates(ARRAY(
@@ -513,6 +564,103 @@ BEGIN
       AND promotion.source_system = line.source_system
       AND promotion.promotion_source_id = line.promotion_source_id;
 
+    -- order_details rows can be hard-deleted in the source, so the incremental
+    -- extract never reports them. A line missing from the batch's full id
+    -- snapshot no longer exists and is marked deleted.
+    IF v_apply_order_line_snapshot THEN
+      UPDATE dw.fact_order_line AS line
+      SET is_deleted = TRUE,
+          -- Pin the deletion: an older staged copy of the line can no longer
+          -- win the source_updated_at comparison in the upsert above.
+          source_updated_at = GREATEST(line.source_updated_at, v_batch.source_window_ended_at),
+          last_loaded_batch_id = p_batch_id
+      WHERE line.source_system = v_batch.source_system
+        AND NOT line.is_deleted
+        AND NOT EXISTS (
+          SELECT 1
+          FROM stg.order_line_ids AS staged
+          WHERE staged.batch_id = p_batch_id
+            AND staged.source_id = line.order_line_source_id
+        );
+
+      INSERT INTO etl.snapshot_state (
+        source_system, entity_name, snapshot_at, snapshot_created_at, last_successful_batch_id
+      )
+      VALUES (
+        v_batch.source_system, 'order_line_ids', v_batch.source_window_ended_at,
+        v_batch.created_at, p_batch_id
+      )
+      ON CONFLICT (source_system, entity_name) DO UPDATE SET
+        snapshot_at = EXCLUDED.snapshot_at,
+        snapshot_created_at = EXCLUDED.snapshot_created_at,
+        last_successful_batch_id = EXCLUDED.last_successful_batch_id
+      WHERE EXCLUDED.snapshot_at > etl.snapshot_state.snapshot_at
+         OR (EXCLUDED.snapshot_at = etl.snapshot_state.snapshot_at
+             AND EXCLUDED.snapshot_created_at > etl.snapshot_state.snapshot_created_at);
+    END IF;
+
+    -- Orders deleted directly in the source database take their lines with
+    -- them (FK cascade). Mark the order, its lines and its social fact deleted;
+    -- the social fact is recomputed below from fact_order.is_deleted as well,
+    -- but only while its reserves are still linked.
+    IF v_apply_order_snapshot THEN
+      -- Pinning source_updated_at keeps an older staged copy from undoing this.
+      UPDATE dw.fact_order AS o
+      SET is_deleted = TRUE,
+          source_updated_at = GREATEST(o.source_updated_at, v_batch.source_window_ended_at),
+          last_loaded_batch_id = p_batch_id
+      WHERE o.source_system = v_batch.source_system
+        AND (NOT o.is_deleted OR o.source_updated_at < v_batch.source_window_ended_at)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM stg.order_ids AS staged
+          WHERE staged.batch_id = p_batch_id
+            AND staged.source_id = o.order_source_id
+        );
+
+      UPDATE dw.fact_order_line AS line
+      SET is_deleted = TRUE,
+          source_updated_at = GREATEST(line.source_updated_at, v_batch.source_window_ended_at),
+          last_loaded_batch_id = p_batch_id
+      FROM dw.fact_order AS o
+      WHERE line.order_key = o.order_key
+        AND o.source_system = v_batch.source_system
+        AND (NOT line.is_deleted OR line.source_updated_at < v_batch.source_window_ended_at)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM stg.order_ids AS staged
+          WHERE staged.batch_id = p_batch_id
+            AND staged.source_id = o.order_source_id
+        );
+
+      UPDATE dw.fact_social_order AS social
+      SET is_deleted = TRUE,
+          last_loaded_batch_id = p_batch_id
+      WHERE social.source_system = v_batch.source_system
+        AND NOT social.is_deleted
+        AND NOT EXISTS (
+          SELECT 1
+          FROM stg.order_ids AS staged
+          WHERE staged.batch_id = p_batch_id
+            AND staged.source_id = social.order_source_id
+        );
+
+      INSERT INTO etl.snapshot_state (
+        source_system, entity_name, snapshot_at, snapshot_created_at, last_successful_batch_id
+      )
+      VALUES (
+        v_batch.source_system, 'order_ids', v_batch.source_window_ended_at,
+        v_batch.created_at, p_batch_id
+      )
+      ON CONFLICT (source_system, entity_name) DO UPDATE SET
+        snapshot_at = EXCLUDED.snapshot_at,
+        snapshot_created_at = EXCLUDED.snapshot_created_at,
+        last_successful_batch_id = EXCLUDED.last_successful_batch_id
+      WHERE EXCLUDED.snapshot_at > etl.snapshot_state.snapshot_at
+         OR (EXCLUDED.snapshot_at = etl.snapshot_state.snapshot_at
+             AND EXCLUDED.snapshot_created_at > etl.snapshot_state.snapshot_created_at);
+    END IF;
+
     INSERT INTO etl.rejected_row (batch_id, entity_name, source_id, reason, payload)
     SELECT
       p_batch_id, 'inventory_movements', m.source_id, 'Missing SKU dimension',
@@ -826,6 +974,8 @@ BEGIN
         'orders', (SELECT COUNT(*) FROM stg.orders WHERE stg.orders.batch_id = p_batch_id),
         'order_status_history', (SELECT COUNT(*) FROM stg.order_status_history WHERE stg.order_status_history.batch_id = p_batch_id),
         'order_lines', (SELECT COUNT(*) FROM stg.order_lines WHERE stg.order_lines.batch_id = p_batch_id),
+        'order_line_ids', (SELECT COUNT(*) FROM stg.order_line_ids WHERE stg.order_line_ids.batch_id = p_batch_id),
+        'order_ids', (SELECT COUNT(*) FROM stg.order_ids WHERE stg.order_ids.batch_id = p_batch_id),
         'facebook_reserves', (SELECT COUNT(*) FROM stg.facebook_reserves WHERE stg.facebook_reserves.batch_id = p_batch_id),
         'payment_transactions', (SELECT COUNT(*) FROM stg.payment_transactions WHERE stg.payment_transactions.batch_id = p_batch_id),
         'inventory_movements', (SELECT COUNT(*) FROM stg.inventory_movements WHERE stg.inventory_movements.batch_id = p_batch_id),
